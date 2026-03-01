@@ -1,0 +1,8 @@
+graph HelloWorld {
+  version: "0.1.0"
+
+  node Greet {
+    input: String
+    output: String
+  }
+}

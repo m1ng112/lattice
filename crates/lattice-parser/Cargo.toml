@@ -1,0 +1,9 @@
+[package]
+name = "lattice-parser"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true

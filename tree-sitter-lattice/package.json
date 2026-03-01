@@ -1,0 +1,16 @@
+{
+  "name": "tree-sitter-lattice",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Lattice programming language",
+  "main": "bindings/node",
+  "keywords": ["tree-sitter", "parser", "lattice"],
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "^0.25"
+  },
+  "scripts": {
+    "generate": "tree-sitter generate",
+    "test": "tree-sitter test",
+    "parse": "tree-sitter parse"
+  }
+}

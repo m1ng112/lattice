@@ -1,0 +1,20 @@
+graph UserService {
+  version: "1.0.0"
+
+  solve {
+    goal: minimize(p99_latency)
+    constraint: availability > 0.999
+  }
+
+  node GetUser {
+    input: Request
+    output: Response
+  }
+
+  node CreateUser {
+    input: Request
+    output: Response
+  }
+
+  edge GetUser -> CreateUser {}
+}

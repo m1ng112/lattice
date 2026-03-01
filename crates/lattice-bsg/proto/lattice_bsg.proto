@@ -1,0 +1,168 @@
+// BSG schema definition (Protocol Buffers)
+// Binary Semantic Graph format for the Lattice programming language.
+
+syntax = "proto3";
+package lattice.bsg;
+
+message Graph {
+  string id = 1;
+  string version = 2;
+  repeated Node nodes = 3;
+  repeated Edge edges = 4;
+  repeated Proof proofs = 5;
+  Metadata metadata = 6;
+}
+
+message Node {
+  string id = 1;
+  NodeKind kind = 2;
+  repeated TypedPort inputs = 3;
+  repeated TypedPort outputs = 4;
+  Properties properties = 5;
+  SemanticSpec semantic = 6;
+  repeated ProofObligation proof_obligations = 7;
+  optional Implementation implementation = 8;
+}
+
+enum NodeKind {
+  INTENT = 0;
+  COMPUTE = 1;
+  IO = 2;
+  BRANCH = 3;
+  MERGE = 4;
+  META = 5;
+}
+
+message Edge {
+  string source_node = 1;
+  string source_port = 2;
+  string target_node = 3;
+  string target_port = 4;
+  EdgeProperties properties = 5;
+}
+
+message TypedPort {
+  string name = 1;
+  Type type = 2;
+}
+
+message Type {
+  oneof kind {
+    PrimitiveType primitive = 1;
+    RefinementType refinement = 2;
+    DependentType dependent = 3;
+    DistributionType distribution = 4;
+    FunctionType function = 5;
+    ProductType product = 6;
+    SumType sum = 7;
+    StreamType stream = 8;
+  }
+}
+
+message PrimitiveType {
+  string name = 1;
+}
+
+message RefinementType {
+  Type base = 1;
+  string predicate = 2;
+}
+
+message DependentType {
+  string name = 1;
+  repeated TypeParam params = 2;
+}
+
+message TypeParam {
+  string name = 1;
+  Type type = 2;
+}
+
+message DistributionType {
+  Type inner = 1;
+}
+
+message FunctionType {
+  repeated Type params = 1;
+  Type return_type = 2;
+}
+
+message ProductType {
+  repeated Field fields = 1;
+}
+
+message Field {
+  string name = 1;
+  Type type = 2;
+}
+
+message SumType {
+  repeated Variant variants = 1;
+}
+
+message Variant {
+  string name = 1;
+  optional Type payload = 2;
+}
+
+message StreamType {
+  Type element = 1;
+}
+
+message Proof {
+  string id = 1;
+  string name = 2;
+  ProofStatus status = 3;
+  bytes proof_term = 4;  // Lean4 proof term
+  repeated string depends_on = 5;
+}
+
+enum ProofStatus {
+  UNVERIFIED = 0;
+  VERIFIED = 1;
+  FAILED = 2;
+  TIMEOUT = 3;
+}
+
+message SemanticSpec {
+  string natural_language = 1;     // Natural language description for AI
+  optional bytes formal_spec = 2;  // Formal specification (TLA+ / Alloy)
+  repeated Example examples = 3;   // Input/output examples
+}
+
+message Example {
+  bytes input = 1;
+  bytes expected_output = 2;
+  string description = 3;
+}
+
+message ProofObligation {
+  string name = 1;
+  string expression = 2;
+}
+
+message Properties {
+  bool idempotent = 1;
+  bool deterministic = 2;
+  map<string, string> extra = 3;
+}
+
+message EdgeProperties {
+  bool async = 1;
+  bool buffered = 2;
+  map<string, string> extra = 3;
+}
+
+message Metadata {
+  string created_at = 1;
+  string modified_at = 2;
+  map<string, string> annotations = 3;
+}
+
+message Implementation {
+  oneof kind {
+    string inline_code = 1;
+    string external_ref = 2;
+    bytes compiled_wasm = 3;
+  }
+}

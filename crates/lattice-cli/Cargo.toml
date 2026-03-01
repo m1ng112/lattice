@@ -1,0 +1,13 @@
+[package]
+name = "lattice-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+lattice-parser = { path = "../lattice-parser" }
+lattice-types = { path = "../lattice-types" }
+lattice-bsg = { path = "../lattice-bsg" }
+colored = "3"
+serde_json = { workspace = true }
