@@ -9,5 +9,6 @@ clap = { version = "4", features = ["derive"] }
 lattice-parser = { path = "../lattice-parser" }
 lattice-types = { path = "../lattice-types" }
 lattice-bsg = { path = "../lattice-bsg" }
+lattice-proof = { path = "../lattice-proof" }
 colored = "3"
 serde_json = { workspace = true }

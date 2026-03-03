@@ -3,6 +3,7 @@ members = [
     "crates/lattice-parser",
     "crates/lattice-types",
     "crates/lattice-bsg",
+    "crates/lattice-proof",
     "crates/lattice-cli",
 ]
 resolver = "2"

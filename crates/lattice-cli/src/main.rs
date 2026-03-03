@@ -46,6 +46,14 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// Verify proof obligations in a .lattice file
+    Prove {
+        /// Input file path
+        file: PathBuf,
+        /// Output format (text, json)
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Dump a BSG file in human-readable format
     BsgDump {
         /// Path to the .bsg file
@@ -95,6 +103,7 @@ fn main() {
     let result = match cli.command {
         Commands::Parse { ref file, ref format } => cmd_parse(file, format, cli.verbose),
         Commands::Check { ref file } => cmd_check(file, cli.verbose),
+        Commands::Prove { ref file, ref format } => cmd_prove(file, format, cli.verbose),
         Commands::Fmt { ref file, write } => cmd_fmt(file, write, cli.verbose),
         Commands::Compile { ref file, ref output } => cmd_compile(file, output, cli.verbose),
         Commands::BsgDump { ref file } => cmd_bsg_dump(file),
@@ -150,7 +159,273 @@ fn cmd_check(file: &PathBuf, verbose: bool) -> Result<(), String> {
         program.len(),
     );
 
+    // Run proof verification as part of check
+    let obligations = lattice_proof::obligation::extract_obligations(&program);
+    if obligations.is_empty() {
+        return Ok(());
+    }
+
+    let results = run_proof_checker(&obligations);
+    let (verified, failed, _unverified, _skipped) = count_results(&results);
+    let total = obligations.len();
+
+    eprintln!(
+        "{} {verified} of {total} proof obligation(s) verified",
+        "proof:".cyan().bold(),
+    );
+
+    if failed > 0 {
+        for (ob, result) in &results {
+            if matches!(result.status, lattice_proof::status::ProofStatus::Failed { .. }) {
+                eprintln!(
+                    "  {} {} {}",
+                    "✗".red().bold(),
+                    ob.name.red(),
+                    result
+                        .message
+                        .as_deref()
+                        .unwrap_or("")
+                        .dimmed(),
+                );
+            }
+        }
+        return Err(format!(
+            "{} {failed} proof obligation(s) failed\n",
+            "error:".red().bold(),
+        ));
+    }
+
     Ok(())
+}
+
+fn cmd_prove(file: &PathBuf, format: &str, verbose: bool) -> Result<(), String> {
+    let source = read_source(file)?;
+    let program = parse_source(&source, file, verbose)?;
+
+    let start = Instant::now();
+    let obligations = lattice_proof::obligation::extract_obligations(&program);
+    let extraction_elapsed = start.elapsed();
+
+    if verbose {
+        eprintln!(
+            "{} Extracted {} obligation(s) in {:.2?}",
+            "timing:".dimmed(),
+            obligations.len(),
+            extraction_elapsed,
+        );
+    }
+
+    if obligations.is_empty() {
+        match format {
+            "json" => {
+                let output = serde_json::json!({
+                    "file": file.display().to_string(),
+                    "obligations": [],
+                    "summary": { "total": 0, "verified": 0, "failed": 0, "unverified": 0, "skipped": 0 }
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            }
+            _ => {
+                println!(
+                    "{} No proof obligations found in {}",
+                    "info:".cyan().bold(),
+                    file.display(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let check_start = Instant::now();
+    let results = run_proof_checker(&obligations);
+    let check_elapsed = check_start.elapsed();
+
+    if verbose {
+        eprintln!(
+            "{} Proof checking took {:.2?}",
+            "timing:".dimmed(),
+            check_elapsed,
+        );
+    }
+
+    let (verified, failed, unverified, skipped) = count_results(&results);
+    let total = obligations.len();
+
+    match format {
+        "json" => {
+            print_prove_json(file, &results, verified, failed, unverified, skipped);
+        }
+        _ => {
+            print_prove_text(file, &results, verified, failed, unverified, skipped, total);
+        }
+    }
+
+    if failed > 0 {
+        Err(format!(
+            "{} {failed} of {total} proof obligation(s) failed\n",
+            "error:".red().bold(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_proof_checker(
+    obligations: &[lattice_proof::obligation::ProofObligation],
+) -> Vec<(lattice_proof::obligation::ProofObligation, lattice_proof::checker::ProofResult)> {
+    let mut checker = lattice_proof::checker::ProofChecker::new();
+    checker.add_backend(Box::new(lattice_proof::arithmetic_backend::ArithmeticBackend));
+    checker.check_all(obligations)
+}
+
+fn count_results(
+    results: &[(lattice_proof::obligation::ProofObligation, lattice_proof::checker::ProofResult)],
+) -> (usize, usize, usize, usize) {
+    use lattice_proof::status::ProofStatus;
+    let mut verified = 0;
+    let mut failed = 0;
+    let mut unverified = 0;
+    let mut skipped = 0;
+    for (_, result) in results {
+        match &result.status {
+            ProofStatus::Verified => verified += 1,
+            ProofStatus::Failed { .. } => failed += 1,
+            ProofStatus::Unverified => unverified += 1,
+            ProofStatus::Skipped => skipped += 1,
+            ProofStatus::Timeout => unverified += 1,
+        }
+    }
+    (verified, failed, unverified, skipped)
+}
+
+fn print_prove_text(
+    file: &PathBuf,
+    results: &[(lattice_proof::obligation::ProofObligation, lattice_proof::checker::ProofResult)],
+    verified: usize,
+    failed: usize,
+    _unverified: usize,
+    _skipped: usize,
+    total: usize,
+) {
+    use lattice_proof::status::ProofStatus;
+
+    println!(
+        "{} Proof obligations for {}",
+        "prove:".cyan().bold(),
+        file.display(),
+    );
+    println!();
+
+    for (ob, result) in results {
+        match &result.status {
+            ProofStatus::Verified => {
+                println!(
+                    "  {} {} {}",
+                    "✓ VERIFIED".green().bold(),
+                    ob.name,
+                    format!("({}ms)", result.duration_ms).dimmed(),
+                );
+            }
+            ProofStatus::Failed { .. } => {
+                println!(
+                    "  {} {} {}",
+                    "✗ FAILED".red().bold(),
+                    ob.name,
+                    format!("({}ms)", result.duration_ms).dimmed(),
+                );
+                if let Some(ce) = &result.counterexample {
+                    println!("    {} {}", "counterexample:".red(), ce);
+                }
+                if let Some(msg) = &result.message {
+                    println!("    {} {}", "reason:".red(), msg);
+                }
+            }
+            ProofStatus::Unverified | ProofStatus::Timeout => {
+                println!(
+                    "  {} {} {}",
+                    "? UNVERIFIED".yellow().bold(),
+                    ob.name,
+                    format!("({}ms)", result.duration_ms).dimmed(),
+                );
+                if let Some(msg) = &result.message {
+                    println!("    {}", msg.dimmed());
+                }
+            }
+            ProofStatus::Skipped => {
+                println!(
+                    "  {} {}",
+                    "- SKIPPED".dimmed(),
+                    ob.name.dimmed(),
+                );
+                if let Some(msg) = &result.message {
+                    println!("    {}", msg.dimmed());
+                }
+            }
+        }
+    }
+
+    println!();
+    if failed > 0 {
+        println!(
+            "{} {verified} of {total} proof obligation(s) verified, {} failed",
+            "summary:".bold(),
+            format!("{failed}").red().bold(),
+        );
+    } else {
+        println!(
+            "{} {verified} of {total} proof obligation(s) verified",
+            "summary:".bold(),
+        );
+    }
+}
+
+fn print_prove_json(
+    file: &PathBuf,
+    results: &[(lattice_proof::obligation::ProofObligation, lattice_proof::checker::ProofResult)],
+    verified: usize,
+    failed: usize,
+    unverified: usize,
+    skipped: usize,
+) {
+    let obligations: Vec<serde_json::Value> = results
+        .iter()
+        .map(|(ob, result)| {
+            let status_str = match &result.status {
+                lattice_proof::status::ProofStatus::Verified => "verified",
+                lattice_proof::status::ProofStatus::Failed { .. } => "failed",
+                lattice_proof::status::ProofStatus::Unverified => "unverified",
+                lattice_proof::status::ProofStatus::Skipped => "skipped",
+                lattice_proof::status::ProofStatus::Timeout => "timeout",
+            };
+            serde_json::json!({
+                "id": ob.id,
+                "name": ob.name,
+                "kind": format!("{:?}", ob.kind),
+                "source": {
+                    "item_name": ob.source.item_name,
+                    "item_kind": ob.source.item_kind,
+                },
+                "status": status_str,
+                "duration_ms": result.duration_ms,
+                "message": result.message,
+                "counterexample": result.counterexample,
+            })
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "file": file.display().to_string(),
+        "obligations": obligations,
+        "summary": {
+            "total": results.len(),
+            "verified": verified,
+            "failed": failed,
+            "unverified": unverified,
+            "skipped": skipped,
+        }
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
 }
 
 fn cmd_fmt(file: &PathBuf, write: bool, verbose: bool) -> Result<(), String> {

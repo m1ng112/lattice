@@ -1,0 +1,14 @@
+function transfer(from: Account, to: Account, amount: Money) -> Result {
+  pre: {
+    from.balance >= amount
+    amount > 0
+  }
+
+  post: {
+    from.balance_new = from.balance - amount
+    to.balance_new = to.balance + amount
+    from.balance_new + to.balance_new = from.balance + to.balance
+  }
+
+  synthesize(strategy: pessimistic_locking)
+}
