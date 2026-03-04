@@ -4,6 +4,8 @@ members = [
     "crates/lattice-types",
     "crates/lattice-bsg",
     "crates/lattice-proof",
+    "crates/lattice-runtime",
+    "crates/lattice-codegen",
     "crates/lattice-cli",
 ]
 resolver = "2"

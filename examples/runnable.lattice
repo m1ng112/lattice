@@ -1,0 +1,19 @@
+graph Calculator {
+  version: "1.0.0"
+
+  node Input {
+    output: Int
+  }
+
+  node Double {
+    input: Int
+    output: Int
+  }
+
+  node Result {
+    input: Int
+  }
+
+  edge Input -> Double {}
+  edge Double -> Result {}
+}

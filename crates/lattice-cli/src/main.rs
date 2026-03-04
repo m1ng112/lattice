@@ -59,6 +59,20 @@ enum Commands {
         /// Path to the .bsg file
         file: PathBuf,
     },
+    /// Run a .lattice program
+    Run {
+        /// Input file path
+        file: PathBuf,
+        /// Enable execution trace
+        #[arg(long)]
+        trace: bool,
+        /// Timeout in milliseconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Input data as JSON (e.g. '{"NodeName": 42}')
+        #[arg(long)]
+        input: Option<String>,
+    },
 }
 
 fn read_source(path: &PathBuf) -> Result<String, String> {
@@ -97,7 +111,8 @@ fn parse_source(
     })
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
@@ -107,6 +122,12 @@ fn main() {
         Commands::Fmt { ref file, write } => cmd_fmt(file, write, cli.verbose),
         Commands::Compile { ref file, ref output } => cmd_compile(file, output, cli.verbose),
         Commands::BsgDump { ref file } => cmd_bsg_dump(file),
+        Commands::Run {
+            ref file,
+            trace,
+            timeout,
+            ref input,
+        } => cmd_run(file, trace, timeout, input.as_deref(), cli.verbose).await,
     };
 
     if let Err(msg) = result {
@@ -498,5 +519,162 @@ fn cmd_bsg_dump(file: &PathBuf) -> Result<(), String> {
         "warning:".yellow().bold(),
         file.display(),
     );
+    Ok(())
+}
+
+async fn cmd_run(
+    file: &PathBuf,
+    trace: bool,
+    timeout: Option<u64>,
+    input: Option<&str>,
+    verbose: bool,
+) -> Result<(), String> {
+    use lattice_parser::ast::Item;
+    use lattice_runtime::graph::ExecutableGraph;
+    use lattice_runtime::node::Value;
+    use lattice_runtime::scheduler::Scheduler;
+    use std::collections::HashMap;
+
+    let source = read_source(file)?;
+    let program = parse_source(&source, file, verbose)?;
+
+    // Find the first Graph item in the program
+    let ast_graph = program
+        .iter()
+        .find_map(|item| match &item.node {
+            Item::Graph(g) => Some(g),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} No graph found in {}\n",
+                "error:".red().bold(),
+                file.display(),
+            )
+        })?;
+
+    if verbose {
+        eprintln!(
+            "{} Found graph '{}' with {} member(s)",
+            "info:".green(),
+            ast_graph.name,
+            ast_graph.members.len(),
+        );
+    }
+
+    // Build executable graph from AST
+    let exec_graph = ExecutableGraph::from_ast(ast_graph).map_err(|e| {
+        format!("{} {}\n", "error:".red().bold(), e)
+    })?;
+
+    // Parse input JSON if provided
+    let inputs: HashMap<String, Value> = if let Some(json_str) = input {
+        let json_val: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+            format!(
+                "{} Invalid input JSON: {}\n",
+                "error:".red().bold(),
+                e,
+            )
+        })?;
+        let obj = json_val.as_object().ok_or_else(|| {
+            format!(
+                "{} Input must be a JSON object mapping node names to values\n",
+                "error:".red().bold(),
+            )
+        })?;
+        obj.iter()
+            .map(|(k, v)| {
+                let value: Value = serde_json::from_value(v.clone()).map_err(|e| {
+                    format!("{} Failed to parse value for '{}': {}\n", "error:".red().bold(), k, e)
+                })?;
+                Ok((k.clone(), value))
+            })
+            .collect::<Result<HashMap<_, _>, String>>()?
+    } else {
+        HashMap::new()
+    };
+
+    // Configure the scheduler
+    let mut scheduler = Scheduler::new();
+    if trace {
+        scheduler = scheduler.with_trace();
+    }
+    if let Some(ms) = timeout {
+        scheduler = scheduler.with_timeout(ms);
+    }
+
+    // Execute the graph
+    let result = scheduler
+        .execute(&exec_graph, inputs)
+        .await
+        .map_err(|e| format!("{} Runtime error: {}\n", "error:".red().bold(), e))?;
+
+    // Print outputs
+    eprintln!(
+        "\n{} Graph '{}' executed in {}ms",
+        "ok:".green().bold(),
+        exec_graph.name,
+        result.duration_ms,
+    );
+
+    if !result.outputs.is_empty() {
+        eprintln!("\n{}", "Outputs:".cyan().bold());
+        for (name, value) in &result.outputs {
+            let json = serde_json::to_string(value).unwrap_or_else(|_| format!("{:?}", value));
+            eprintln!("  {} {} {}", "●".green(), name.bold(), json);
+        }
+    }
+
+    // Print trace if enabled
+    if trace && !result.trace.is_empty() {
+        use lattice_runtime::scheduler::TracePhase;
+        eprintln!("\n{}", "Execution trace:".cyan().bold());
+        for entry in &result.trace {
+            match &entry.phase {
+                TracePhase::Start => {
+                    eprintln!(
+                        "  {} [{}ms] {} started",
+                        "→".dimmed(),
+                        entry.timestamp_ms,
+                        entry.node.bold(),
+                    );
+                }
+                TracePhase::Complete => {
+                    let dur = entry
+                        .duration_ms
+                        .map(|d| format!(" ({}ms)", d))
+                        .unwrap_or_default();
+                    let val = entry
+                        .value
+                        .as_ref()
+                        .map(|v| {
+                            format!(
+                                " = {}",
+                                serde_json::to_string(v).unwrap_or_else(|_| format!("{:?}", v))
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "  {} [{}ms] {} completed{}{}",
+                        "✓".green(),
+                        entry.timestamp_ms,
+                        entry.node.bold(),
+                        dur.dimmed(),
+                        val.dimmed(),
+                    );
+                }
+                TracePhase::Error(msg) => {
+                    eprintln!(
+                        "  {} [{}ms] {} failed: {}",
+                        "✗".red(),
+                        entry.timestamp_ms,
+                        entry.node.bold(),
+                        msg.red(),
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }

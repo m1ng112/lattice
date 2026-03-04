@@ -10,5 +10,7 @@ lattice-parser = { path = "../lattice-parser" }
 lattice-types = { path = "../lattice-types" }
 lattice-bsg = { path = "../lattice-bsg" }
 lattice-proof = { path = "../lattice-proof" }
+lattice-runtime = { path = "../lattice-runtime" }
 colored = "3"
 serde_json = { workspace = true }
+tokio = { version = "1", features = ["full"] }

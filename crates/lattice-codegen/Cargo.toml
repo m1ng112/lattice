@@ -1,0 +1,13 @@
+[package]
+name = "lattice-codegen"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lattice-parser = { path = "../lattice-parser" }
+lattice-runtime = { path = "../lattice-runtime" }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+petgraph = "0.7"
