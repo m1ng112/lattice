@@ -417,8 +417,12 @@ impl Compiler {
 
         let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
 
-        // Collect free variables (simplified: we capture all known variables)
-        let captured: Vec<String> = Vec::new(); // TODO: proper free variable analysis
+        // Collect free variables via analysis
+        let mut free_vars = std::collections::HashSet::new();
+        let mut bound_vars: std::collections::HashSet<String> =
+            param_names.iter().cloned().collect();
+        collect_free_vars(&body.node, &mut free_vars, &mut bound_vars);
+        let captured: Vec<String> = free_vars.into_iter().collect();
 
         let func_idx = self.functions.len();
         self.functions.push(Function {
@@ -429,6 +433,150 @@ impl Compiler {
 
         instructions.push(Instruction::MakeClosure(func_idx, captured));
         Ok(())
+    }
+}
+
+/// Collect free variables in an expression (variables not bound by local scope).
+fn collect_free_vars(
+    expr: &ast::Expr,
+    free: &mut std::collections::HashSet<String>,
+    bound: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        ast::Expr::Ident(name) => {
+            if !bound.contains(name) {
+                free.insert(name.clone());
+            }
+        }
+        ast::Expr::IntLit(_)
+        | ast::Expr::FloatLit(_)
+        | ast::Expr::StringLit(_)
+        | ast::Expr::BoolLit(_) => {}
+
+        ast::Expr::BinOp { left, right, .. } => {
+            collect_free_vars(&left.node, free, bound);
+            collect_free_vars(&right.node, free, bound);
+        }
+        ast::Expr::UnaryOp { operand, .. } => {
+            collect_free_vars(&operand.node, free, bound);
+        }
+        ast::Expr::Call { func, args } => {
+            collect_free_vars(&func.node, free, bound);
+            for arg in args {
+                collect_free_vars(&arg.node, free, bound);
+            }
+        }
+        ast::Expr::CallNamed { func, args } => {
+            collect_free_vars(&func.node, free, bound);
+            for (_, arg) in args {
+                collect_free_vars(&arg.node, free, bound);
+            }
+        }
+        ast::Expr::Field { expr, .. } => {
+            collect_free_vars(&expr.node, free, bound);
+        }
+        ast::Expr::Index { expr, index } => {
+            collect_free_vars(&expr.node, free, bound);
+            collect_free_vars(&index.node, free, bound);
+        }
+        ast::Expr::Pipeline { left, right } => {
+            collect_free_vars(&left.node, free, bound);
+            collect_free_vars(&right.node, free, bound);
+        }
+        ast::Expr::Lambda { params, body } => {
+            let mut inner_bound = bound.clone();
+            for p in params {
+                inner_bound.insert(p.name.clone());
+            }
+            collect_free_vars(&body.node, free, &mut inner_bound);
+        }
+        ast::Expr::Let { name, value, .. } => {
+            collect_free_vars(&value.node, free, bound);
+            bound.insert(name.clone());
+        }
+        ast::Expr::If { cond, then_, else_ } => {
+            collect_free_vars(&cond.node, free, bound);
+            collect_free_vars(&then_.node, free, bound);
+            if let Some(e) = else_ {
+                collect_free_vars(&e.node, free, bound);
+            }
+        }
+        ast::Expr::Block(exprs) => {
+            let mut inner_bound = bound.clone();
+            for e in exprs {
+                collect_free_vars(&e.node, free, &mut inner_bound);
+            }
+        }
+        ast::Expr::Match { expr, arms } => {
+            collect_free_vars(&expr.node, free, bound);
+            for arm in arms {
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern.node, &mut arm_bound);
+                if let Some(guard) = &arm.guard {
+                    collect_free_vars(&guard.node, free, &mut arm_bound);
+                }
+                collect_free_vars(&arm.body.node, free, &mut arm_bound);
+            }
+        }
+        ast::Expr::Array(elems) => {
+            for e in elems {
+                collect_free_vars(&e.node, free, bound);
+            }
+        }
+        ast::Expr::Record(fields) => {
+            for (_, v) in fields {
+                collect_free_vars(&v.node, free, bound);
+            }
+        }
+        // Other expressions: traverse children if any
+        ast::Expr::Slice { expr, start, end } => {
+            collect_free_vars(&expr.node, free, bound);
+            if let Some(s) = start {
+                collect_free_vars(&s.node, free, bound);
+            }
+            if let Some(e) = end {
+                collect_free_vars(&e.node, free, bound);
+            }
+        }
+        ast::Expr::Range { start, end } => {
+            collect_free_vars(&start.node, free, bound);
+            collect_free_vars(&end.node, free, bound);
+        }
+        ast::Expr::Try(e) | ast::Expr::Yield(e) => {
+            collect_free_vars(&e.node, free, bound);
+        }
+        ast::Expr::Ascription { expr, .. } => {
+            collect_free_vars(&expr.node, free, bound);
+        }
+        ast::Expr::WithUnit { value, .. } => {
+            collect_free_vars(&value.node, free, bound);
+        }
+        _ => {
+            // DoBlock, Select, Project, Join, GroupBy, ForAll, Exists, Branch, Synthesize
+            // These are less common; skip for now
+        }
+    }
+}
+
+fn collect_pattern_bindings(
+    pattern: &ast::Pattern,
+    bound: &mut std::collections::HashSet<String>,
+) {
+    match pattern {
+        ast::Pattern::Ident(name) => {
+            bound.insert(name.clone());
+        }
+        ast::Pattern::Constructor(_, sub_pats) => {
+            for p in sub_pats {
+                collect_pattern_bindings(&p.node, bound);
+            }
+        }
+        ast::Pattern::Record(fields) => {
+            for (_, p) in fields {
+                collect_pattern_bindings(&p.node, bound);
+            }
+        }
+        ast::Pattern::Wildcard | ast::Pattern::Literal(_) => {}
     }
 }
 

@@ -1331,6 +1331,39 @@ mod tests {
         assert_eq!(eval_expr(&expr).unwrap(), Value::Int(10));
     }
 
+    #[test]
+    fn lambda_captures_variable() {
+        use lattice_parser::ast::Param;
+        // let multiplier = 3; let f = fn(x) -> x * multiplier; f(10) => 30
+        let expr = Expr::Block(vec![
+            s(Expr::Let {
+                name: "multiplier".into(),
+                type_ann: None,
+                value: Box::new(int(3)),
+            }),
+            s(Expr::Let {
+                name: "f".into(),
+                type_ann: None,
+                value: Box::new(s(Expr::Lambda {
+                    params: vec![Param {
+                        name: "x".into(),
+                        type_expr: Spanned::dummy(lattice_parser::ast::TypeExpr::Named("Int".into())),
+                    }],
+                    body: Box::new(s(binop(
+                        s(Expr::Ident("x".into())),
+                        BinOp::Mul,
+                        s(Expr::Ident("multiplier".into())),
+                    ))),
+                })),
+            }),
+            s(Expr::Call {
+                func: Box::new(s(Expr::Ident("f".into()))),
+                args: vec![int(10)],
+            }),
+        ]);
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(30));
+    }
+
     // ── Error cases ─────────────────────────
 
     #[test]
