@@ -492,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn function_persistence_across_lines() {
+        let mut repl = Repl::new();
+        let r1 = repl.eval_line("function double(x: Int) -> Int { x * 2 }");
+        assert!(matches!(r1, ReplResult::Empty | ReplResult::Value(_)));
+        let r2 = repl.eval_line("double(5)");
+        assert_eq!(r2, ReplResult::Value("10".to_string()));
+    }
+
+    #[test]
+    fn function_can_use_persistent_variables() {
+        let mut repl = Repl::new();
+        repl.eval_line("let factor = 3");
+        let r1 = repl.eval_line("function triple(x: Int) -> Int { x * factor }");
+        assert!(matches!(r1, ReplResult::Empty | ReplResult::Value(_)));
+        let r2 = repl.eval_line("triple(7)");
+        assert_eq!(r2, ReplResult::Value("21".to_string()));
+    }
+
+    #[test]
     fn format_value_array() {
         let val = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
         assert_eq!(format_value(&val), "[1, 2, 3]");

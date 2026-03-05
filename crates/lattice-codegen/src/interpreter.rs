@@ -9,6 +9,8 @@ pub struct Interpreter {
     /// Persistent global variables that survive across multiple executions (for REPL).
     globals: HashMap<String, Value>,
     builtins: HashMap<String, Box<dyn Fn(Vec<Value>) -> Result<Value, CodegenError>>>,
+    /// Persistent user-defined functions that survive across multiple executions (for REPL).
+    persistent_functions: Vec<Function>,
 }
 
 impl Default for Interpreter {
@@ -24,6 +26,7 @@ impl Interpreter {
             variables: HashMap::new(),
             globals: HashMap::new(),
             builtins: HashMap::new(),
+            persistent_functions: Vec::new(),
         }
     }
 
@@ -131,8 +134,19 @@ impl Interpreter {
         self.run_function(entry, vec![], program)
     }
 
-    /// Execute a compiled program, persisting top-level variables for REPL use.
+    /// Execute a compiled program, persisting top-level variables and functions for REPL use.
     pub fn execute_persistent(&mut self, program: &Program) -> Result<Value, CodegenError> {
+        // Save non-entry, non-lambda functions to persistent storage for cross-line calls
+        for (i, func) in program.functions.iter().enumerate() {
+            if i != program.entry && !func.name.starts_with("__lambda_") {
+                // Replace existing function with same name, or add new
+                if let Some(existing) = self.persistent_functions.iter_mut().find(|f| f.name == func.name) {
+                    *existing = func.clone();
+                } else {
+                    self.persistent_functions.push(func.clone());
+                }
+            }
+        }
         let entry = program.functions[program.entry].clone();
         self.run_function_persistent(entry, program)
     }
@@ -535,6 +549,7 @@ impl Interpreter {
                         self.stack.push(result);
                     } else if let Some(callee) =
                         program.functions.iter().find(|f| f.name == name)
+                            .or_else(|| self.persistent_functions.iter().find(|f| f.name == name))
                     {
                         let callee = callee.clone();
                         let result = self.run_function(callee, call_args, program)?;
@@ -945,6 +960,7 @@ impl Interpreter {
                         self.stack.push(result);
                     } else if let Some(callee) =
                         program.functions.iter().find(|f| f.name == name)
+                            .or_else(|| self.persistent_functions.iter().find(|f| f.name == name))
                     {
                         let callee = callee.clone();
                         let result = self.run_function(callee, call_args, program)?;
