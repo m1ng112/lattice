@@ -106,6 +106,24 @@ impl Interpreter {
                     let a = self.pop()?;
                     self.stack.push(arith_mod(a, b)?);
                 }
+                Instruction::Concat => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    match (a, b) {
+                        (Value::String(x), Value::String(y)) => {
+                            self.stack.push(Value::String(format!("{x}{y}")));
+                        }
+                        (Value::Array(mut x), Value::Array(y)) => {
+                            x.extend(y);
+                            self.stack.push(Value::Array(x));
+                        }
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "++ requires string or array operands".into(),
+                            ))
+                        }
+                    }
+                }
                 Instruction::Neg => {
                     let a = self.pop()?;
                     let result = match a {
@@ -659,6 +677,34 @@ mod tests {
         assert_eq!(
             eval_expr(&expr).unwrap(),
             Value::String("hello world".into())
+        );
+    }
+
+    // ── String concatenation (++) ────────────
+
+    #[test]
+    fn string_concat_operator() {
+        let expr = binop(
+            s(Expr::StringLit("hello ".into())),
+            BinOp::Concat,
+            s(Expr::StringLit("world".into())),
+        );
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::String("hello world".into())
+        );
+    }
+
+    #[test]
+    fn array_concat_operator() {
+        let expr = Expr::BinOp {
+            left: Box::new(s(Expr::Array(vec![int(1), int(2)]))),
+            op: BinOp::Concat,
+            right: Box::new(s(Expr::Array(vec![int(3), int(4)]))),
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])
         );
     }
 

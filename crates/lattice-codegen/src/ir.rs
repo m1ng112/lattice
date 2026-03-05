@@ -33,6 +33,7 @@ pub enum Instruction {
     Div,
     Mod,
     Neg,
+    Concat,
 
     // ── Comparison ──────────────────────────
     Eq,

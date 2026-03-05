@@ -143,6 +143,7 @@ impl Compiler {
                     ast::BinOp::Geq => Instruction::Geq,
                     ast::BinOp::And => Instruction::And,
                     ast::BinOp::Or => Instruction::Or,
+                    ast::BinOp::Concat => Instruction::Concat,
                     other => {
                         return Err(CodegenError::Unsupported(format!("{other:?}")));
                     }
