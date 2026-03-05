@@ -40,13 +40,16 @@ graph UserService {
 ```
 lattice/
 ├── crates/
-│   ├── lattice-parser/     # Lexer, recursive descent parser, AST, pretty printer
-│   ├── lattice-types/      # Type system, dependent types, normalization, type checker
-│   ├── lattice-proof/      # Proof obligation extraction, arithmetic solver backend
-│   ├── lattice-bsg/        # Binary Semantic Graph (protobuf serialization)
-│   └── lattice-cli/        # CLI: parse, check, prove, fmt, compile, bsg-dump
-├── tree-sitter-lattice/    # Tree-sitter grammar (WIP)
-└── examples/               # Example .lattice programs
+│   ├── lattice-parser/       # Lexer, recursive descent parser, AST, pretty printer
+│   ├── lattice-types/        # Type system, dependent types, normalization, type checker
+│   ├── lattice-proof/        # Proof obligation extraction, arithmetic solver backend
+│   ├── lattice-bsg/          # Binary Semantic Graph (protobuf serialization)
+│   ├── lattice-runtime/      # Async graph execution (petgraph + tokio), profiler
+│   ├── lattice-codegen/      # Stack-based IR, compiler, interpreter, optimizer
+│   ├── lattice-synthesizer/  # AI synthesis engine, intent extractor, self-optimizer
+│   └── lattice-cli/          # CLI: parse, check, prove, fmt, compile, run, synthesize, profile
+├── tree-sitter-lattice/      # Tree-sitter grammar (WIP)
+└── examples/                 # Example .lattice programs
 ```
 
 ## Quick Start
@@ -82,6 +85,9 @@ cargo run -p lattice-cli -- prove examples/transfer.lattice --format json
 | `lattice fmt <file>` | Pretty-print (`--write` to overwrite) |
 | `lattice compile <file>` | Compile to BSG (`-o output.bsg`) |
 | `lattice bsg-dump <file>` | Dump BSG in human-readable format |
+| `lattice run <file>` | Execute a graph (`--trace`, `--timeout`, `--input`) |
+| `lattice synthesize <file>` | Show/run AI synthesis (`--dry-run`, `--format text\|json`) |
+| `lattice profile <file>` | Profile graph execution (`--threshold`, `--input`) |
 
 Global flags: `-v` for verbose timing output.
 
@@ -133,8 +139,8 @@ The proof engine extracts obligations and verifies them using an arithmetic solv
 |-------|--------|-------------|
 | Phase 1: Foundation | Done | Parser, type system, BSG, CLI |
 | Phase 2: Verification | Done | Proof engine, dependent types |
-| Phase 3: Graph Runtime | Planned | Dataflow execution, code generation |
-| Phase 4: AI Integration | Planned | LLM synthesis, self-optimization |
+| Phase 3: Graph Runtime | Done | Dataflow execution, code generation |
+| Phase 4: AI Integration | Done | LLM synthesis, self-optimization |
 | Phase 5: Ecosystem | Planned | LSP, package manager, playground |
 
 ## Test Suite
@@ -143,7 +149,7 @@ The proof engine extracts obligations and verifies them using an arithmetic solv
 cargo test --workspace
 ```
 
-163 tests across all crates:
+267 tests across all crates:
 
 | Crate | Tests | Coverage |
 |-------|-------|----------|
@@ -151,6 +157,9 @@ cargo test --workspace
 | lattice-types | 88 | Types, inference, dependent types, normalization |
 | lattice-proof | 23 | Obligation extraction, arithmetic prover, caching |
 | lattice-bsg | 6 | Protobuf schema, AST↔BSG conversion, roundtrip |
+| lattice-runtime | 32 | Graph execution, scheduling, profiling, streams |
+| lattice-codegen | 41 | IR compilation, interpretation, optimization |
+| lattice-synthesizer | 31 | Synthesis engine, extraction, optimization, caching |
 
 ## Language Spec
 

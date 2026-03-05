@@ -73,6 +73,28 @@ enum Commands {
         #[arg(long)]
         input: Option<String>,
     },
+    /// Show synthesis requests in a .lattice file
+    Synthesize {
+        /// Input file path
+        file: PathBuf,
+        /// Dry-run mode: show what would be synthesized without calling LLM
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Output format (text, json)
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Profile a graph execution and report hotspots
+    Profile {
+        /// Input file path
+        file: PathBuf,
+        /// Hotspot threshold percentage (nodes above this are flagged)
+        #[arg(long, default_value_t = 30.0)]
+        threshold: f64,
+        /// Input data as JSON (e.g. '{"NodeName": 42}')
+        #[arg(long)]
+        input: Option<String>,
+    },
 }
 
 fn read_source(path: &PathBuf) -> Result<String, String> {
@@ -128,6 +150,16 @@ async fn main() {
             timeout,
             ref input,
         } => cmd_run(file, trace, timeout, input.as_deref(), cli.verbose).await,
+        Commands::Synthesize {
+            ref file,
+            dry_run,
+            ref format,
+        } => cmd_synthesize(file, dry_run, format, cli.verbose).await,
+        Commands::Profile {
+            ref file,
+            threshold,
+            ref input,
+        } => cmd_profile(file, threshold, input.as_deref(), cli.verbose).await,
     };
 
     if let Err(msg) = result {
@@ -519,6 +551,325 @@ fn cmd_bsg_dump(file: &PathBuf) -> Result<(), String> {
         "warning:".yellow().bold(),
         file.display(),
     );
+    Ok(())
+}
+
+async fn cmd_synthesize(
+    file: &PathBuf,
+    dry_run: bool,
+    format: &str,
+    verbose: bool,
+) -> Result<(), String> {
+    let source = read_source(file)?;
+    let program = parse_source(&source, file, verbose)?;
+
+    let start = Instant::now();
+    let requests = lattice_synthesizer::extractor::extract_requests(&program);
+    let extraction_elapsed = start.elapsed();
+
+    if verbose {
+        eprintln!(
+            "{} Extracted {} synthesis request(s) in {:.2?}",
+            "timing:".dimmed(),
+            requests.len(),
+            extraction_elapsed,
+        );
+    }
+
+    if requests.is_empty() {
+        match format {
+            "json" => {
+                let output = serde_json::json!({
+                    "file": file.display().to_string(),
+                    "requests": [],
+                });
+                println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            }
+            _ => {
+                println!(
+                    "{} No synthesis requests found in {}",
+                    "info:".cyan().bold(),
+                    file.display(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    match format {
+        "json" => {
+            let json_requests: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "function": r.function_name,
+                        "parameters": r.parameters,
+                        "return_type": r.return_type,
+                        "preconditions": r.preconditions,
+                        "postconditions": r.postconditions,
+                        "invariants": r.invariants,
+                        "strategy": r.strategy,
+                        "optimize": r.optimize,
+                    })
+                })
+                .collect();
+            let output = serde_json::json!({
+                "file": file.display().to_string(),
+                "requests": json_requests,
+                "dry_run": dry_run,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        _ => {
+            println!(
+                "{} Synthesis requests in {}",
+                "synthesize:".cyan().bold(),
+                file.display(),
+            );
+            println!();
+            for (i, req) in requests.iter().enumerate() {
+                println!(
+                    "  {} {}",
+                    format!("[{}]", i + 1).dimmed(),
+                    req.function_name.bold(),
+                );
+                if !req.parameters.is_empty() {
+                    let params: Vec<String> = req
+                        .parameters
+                        .iter()
+                        .map(|(n, t)| format!("{n}: {t}"))
+                        .collect();
+                    println!("      {} ({})", "params:".dimmed(), params.join(", "));
+                }
+                println!("      {} {}", "return:".dimmed(), req.return_type);
+                if !req.preconditions.is_empty() {
+                    println!(
+                        "      {} {}",
+                        "pre:".dimmed(),
+                        req.preconditions.join(", "),
+                    );
+                }
+                if !req.postconditions.is_empty() {
+                    println!(
+                        "      {} {}",
+                        "post:".dimmed(),
+                        req.postconditions.join(", "),
+                    );
+                }
+                if let Some(ref strategy) = req.strategy {
+                    println!("      {} {:?}", "strategy:".dimmed(), strategy);
+                }
+                if let Some(ref opt) = req.optimize {
+                    println!("      {} {:?}", "optimize:".dimmed(), opt);
+                }
+                println!();
+            }
+        }
+    }
+
+    if dry_run {
+        eprintln!(
+            "{} Dry-run mode — no LLM calls made. Pass --dry-run=false to synthesize.",
+            "info:".yellow().bold(),
+        );
+    } else {
+        // Attempt actual synthesis
+        let client = lattice_synthesizer::LlmClient::new()
+            .map_err(|e| format!("{} {}\n", "error:".red().bold(), e))?;
+        let synth = lattice_synthesizer::Synthesizer::new(client);
+
+        for req in &requests {
+            eprintln!(
+                "{} Synthesizing {}...",
+                "synth:".cyan().bold(),
+                req.function_name,
+            );
+            let result = synth.synthesize(req).await;
+            match result {
+                lattice_synthesizer::SynthesisResult::Synthesized {
+                    code,
+                    verified,
+                    attempts,
+                } => {
+                    eprintln!(
+                        "  {} {} (verified={}, attempts={})",
+                        "✓".green().bold(),
+                        req.function_name,
+                        verified,
+                        attempts,
+                    );
+                    println!("{}", code);
+                }
+                lattice_synthesizer::SynthesisResult::Cached { code, cache_key } => {
+                    eprintln!(
+                        "  {} {} (cached: {})",
+                        "✓".green().bold(),
+                        req.function_name,
+                        cache_key,
+                    );
+                    println!("{}", code);
+                }
+                lattice_synthesizer::SynthesisResult::ManualRequired { reason } => {
+                    eprintln!(
+                        "  {} {} — manual implementation required",
+                        "✗".red().bold(),
+                        req.function_name,
+                    );
+                    eprintln!("    {}", reason.dimmed());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_profile(
+    file: &PathBuf,
+    threshold: f64,
+    input: Option<&str>,
+    verbose: bool,
+) -> Result<(), String> {
+    use lattice_parser::ast::Item;
+    use lattice_runtime::graph::ExecutableGraph;
+    use lattice_runtime::node::Value;
+    use lattice_runtime::profiler;
+    use lattice_runtime::scheduler::Scheduler;
+    use std::collections::HashMap;
+
+    let source = read_source(file)?;
+    let program = parse_source(&source, file, verbose)?;
+
+    let ast_graph = program
+        .iter()
+        .find_map(|item| match &item.node {
+            Item::Graph(g) => Some(g),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "{} No graph found in {}\n",
+                "error:".red().bold(),
+                file.display(),
+            )
+        })?;
+
+    if verbose {
+        eprintln!(
+            "{} Found graph '{}' with {} member(s)",
+            "info:".green(),
+            ast_graph.name,
+            ast_graph.members.len(),
+        );
+    }
+
+    let exec_graph = ExecutableGraph::from_ast(ast_graph).map_err(|e| {
+        format!("{} {}\n", "error:".red().bold(), e)
+    })?;
+
+    let inputs: HashMap<String, Value> = if let Some(json_str) = input {
+        let json_val: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+            format!(
+                "{} Invalid input JSON: {}\n",
+                "error:".red().bold(),
+                e,
+            )
+        })?;
+        let obj = json_val.as_object().ok_or_else(|| {
+            format!(
+                "{} Input must be a JSON object\n",
+                "error:".red().bold(),
+            )
+        })?;
+        obj.iter()
+            .map(|(k, v)| {
+                let value: Value = serde_json::from_value(v.clone()).map_err(|e| {
+                    format!("{} Failed to parse value for '{}': {}\n", "error:".red().bold(), k, e)
+                })?;
+                Ok((k.clone(), value))
+            })
+            .collect::<Result<HashMap<_, _>, String>>()?
+    } else {
+        HashMap::new()
+    };
+
+    // Run with tracing enabled so we can build a profile
+    let scheduler = Scheduler::new().with_trace();
+    let result = scheduler
+        .execute(&exec_graph, inputs)
+        .await
+        .map_err(|e| format!("{} Runtime error: {}\n", "error:".red().bold(), e))?;
+
+    let total_duration = std::time::Duration::from_millis(result.duration_ms);
+    let report = profiler::build_report(&result.trace, total_duration);
+
+    // Print the summary
+    println!(
+        "{} Profile for graph '{}'",
+        "profile:".cyan().bold(),
+        exec_graph.name,
+    );
+    println!();
+    println!("{}", report.summary());
+
+    // Hotspot analysis with user-specified threshold
+    let hotspots = report.hotspots(threshold);
+    if !hotspots.is_empty() {
+        println!(
+            "{} {} hotspot(s) above {:.1}% threshold:",
+            "analysis:".yellow().bold(),
+            hotspots.len(),
+            threshold,
+        );
+        for h in &hotspots {
+            let pct = if total_duration.as_nanos() > 0 {
+                (h.duration.as_nanos() as f64 / total_duration.as_nanos() as f64) * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "  {} {} — {:.2?} ({:.1}%)",
+                "●".red(),
+                h.node_name.bold(),
+                h.duration,
+                pct,
+            );
+        }
+    }
+
+    // Run optimizer analysis
+    let suggestions =
+        lattice_synthesizer::optimizer::analyze_hotspots(&report, &program);
+    if !suggestions.is_empty() {
+        println!();
+        println!(
+            "{} {} optimization suggestion(s):",
+            "optimize:".green().bold(),
+            suggestions.len(),
+        );
+        for s in &suggestions {
+            let action = match &s.suggested_action {
+                lattice_synthesizer::optimizer::SuggestedAction::Parallelize => {
+                    "parallelize".to_string()
+                }
+                lattice_synthesizer::optimizer::SuggestedAction::Cache => "cache".to_string(),
+                lattice_synthesizer::optimizer::SuggestedAction::Rewrite(hint) => {
+                    format!("rewrite: {hint}")
+                }
+                lattice_synthesizer::optimizer::SuggestedAction::Synthesize => {
+                    "re-synthesize".to_string()
+                }
+            };
+            println!(
+                "  {} {} — {} ({})",
+                "→".cyan(),
+                s.node_name.bold(),
+                s.reason.dimmed(),
+                action,
+            );
+        }
+    }
+
     Ok(())
 }
 
