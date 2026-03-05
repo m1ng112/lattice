@@ -111,6 +111,9 @@ impl Interpreter {
                 _ => Ok(Value::String("<value>".to_string())),
             }
         });
+        // Note: map, filter, fold, flatMap need access to the interpreter
+        // and program, so they are handled specially in the Call instruction.
+        // We register placeholder builtins that will be intercepted.
         self.register_builtin("print".into(), |args| {
             if let Some(val) = args.first() {
                 match val {
@@ -141,6 +144,135 @@ impl Interpreter {
 
     fn pop(&mut self) -> Result<Value, CodegenError> {
         self.stack.pop().ok_or(CodegenError::StackUnderflow)
+    }
+
+    /// Try to handle higher-order builtin functions (map, filter, fold, flatMap, forEach, any, all).
+    /// Returns Some(result) if the name matches, None otherwise.
+    fn try_hof_builtin(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        program: &Program,
+    ) -> Result<Option<Value>, CodegenError> {
+        match name {
+            "map" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("map requires 2 arguments (array, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("map: first argument must be array".into())),
+                };
+                let closure = args[1].clone();
+                let mut result = Vec::with_capacity(arr.len());
+                for elem in arr {
+                    let val = self.call_closure_value(closure.clone(), vec![elem], program)?;
+                    result.push(val);
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "filter" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("filter requires 2 arguments (array, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("filter: first argument must be array".into())),
+                };
+                let closure = args[1].clone();
+                let mut result = Vec::new();
+                for elem in arr {
+                    let keep = self.call_closure_value(closure.clone(), vec![elem.clone()], program)?;
+                    if matches!(keep, Value::Bool(true)) {
+                        result.push(elem);
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "fold" => {
+                if args.len() != 3 {
+                    return Err(CodegenError::TypeError("fold requires 3 arguments (array, init, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("fold: first argument must be array".into())),
+                };
+                let mut acc = args[1].clone();
+                let closure = args[2].clone();
+                for elem in arr {
+                    acc = self.call_closure_value(closure.clone(), vec![acc, elem], program)?;
+                }
+                Ok(Some(acc))
+            }
+            "flatMap" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("flatMap requires 2 arguments (array, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("flatMap: first argument must be array".into())),
+                };
+                let closure = args[1].clone();
+                let mut result = Vec::new();
+                for elem in arr {
+                    let val = self.call_closure_value(closure.clone(), vec![elem], program)?;
+                    match val {
+                        Value::Array(inner) => result.extend(inner),
+                        other => result.push(other),
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "forEach" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("forEach requires 2 arguments (array, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("forEach: first argument must be array".into())),
+                };
+                let closure = args[1].clone();
+                for elem in arr {
+                    self.call_closure_value(closure.clone(), vec![elem], program)?;
+                }
+                Ok(Some(Value::Null))
+            }
+            "any" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("any requires 2 arguments (array, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("any: first argument must be array".into())),
+                };
+                let closure = args[1].clone();
+                for elem in arr {
+                    let val = self.call_closure_value(closure.clone(), vec![elem], program)?;
+                    if matches!(val, Value::Bool(true)) {
+                        return Ok(Some(Value::Bool(true)));
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "all" => {
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("all requires 2 arguments (array, fn)".into()));
+                }
+                let arr = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("all: first argument must be array".into())),
+                };
+                let closure = args[1].clone();
+                for elem in arr {
+                    let val = self.call_closure_value(closure.clone(), vec![elem], program)?;
+                    if !matches!(val, Value::Bool(true)) {
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                }
+                Ok(Some(Value::Bool(true)))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn call_closure_value(
@@ -396,8 +528,9 @@ impl Interpreter {
                     }
                     call_args.reverse();
 
-                    let is_builtin = self.builtins.contains_key(&name);
-                    if is_builtin {
+                    if let Some(result) = self.try_hof_builtin(&name, &call_args, program)? {
+                        self.stack.push(result);
+                    } else if self.builtins.contains_key(&name) {
                         let result = (self.builtins[&name])(call_args)?;
                         self.stack.push(result);
                     } else if let Some(callee) =
@@ -411,7 +544,6 @@ impl Interpreter {
                         .or_else(|| self.globals.get(&name))
                         .cloned()
                     {
-                        // Try calling as a closure
                         let result = self.call_closure_value(closure_val, call_args, program)?;
                         self.stack.push(result);
                     } else {
@@ -806,8 +938,9 @@ impl Interpreter {
                         call_args.push(self.pop()?);
                     }
                     call_args.reverse();
-                    let is_builtin = self.builtins.contains_key(&name);
-                    if is_builtin {
+                    if let Some(result) = self.try_hof_builtin(&name, &call_args, program)? {
+                        self.stack.push(result);
+                    } else if self.builtins.contains_key(&name) {
                         let result = (self.builtins[&name])(call_args)?;
                         self.stack.push(result);
                     } else if let Some(callee) =
@@ -1541,6 +1674,93 @@ mod tests {
             eval_expr(&expr).unwrap(),
             Value::Array(vec![Value::Int(3), Value::Int(2), Value::Int(1)])
         );
+    }
+
+    // ── Higher-order array ops ──────────────
+
+    #[test]
+    fn map_with_lambda() {
+        use lattice_parser::ast::Param;
+        // map([1, 2, 3], fn(x) -> x * 2) => [2, 4, 6]
+        let expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("map".into()))),
+            args: vec![
+                s(Expr::Array(vec![int(1), int(2), int(3)])),
+                s(Expr::Lambda {
+                    params: vec![Param {
+                        name: "x".into(),
+                        type_expr: Spanned::dummy(lattice_parser::ast::TypeExpr::Named("Int".into())),
+                    }],
+                    body: Box::new(s(binop(
+                        s(Expr::Ident("x".into())),
+                        BinOp::Mul,
+                        int(2),
+                    ))),
+                }),
+            ],
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+        );
+    }
+
+    #[test]
+    fn filter_with_lambda() {
+        use lattice_parser::ast::Param;
+        // filter([1, 2, 3, 4, 5], fn(x) -> x > 2) => [3, 4, 5]
+        let expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("filter".into()))),
+            args: vec![
+                s(Expr::Array(vec![int(1), int(2), int(3), int(4), int(5)])),
+                s(Expr::Lambda {
+                    params: vec![Param {
+                        name: "x".into(),
+                        type_expr: Spanned::dummy(lattice_parser::ast::TypeExpr::Named("Int".into())),
+                    }],
+                    body: Box::new(s(binop(
+                        s(Expr::Ident("x".into())),
+                        BinOp::Gt,
+                        int(2),
+                    ))),
+                }),
+            ],
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::Array(vec![Value::Int(3), Value::Int(4), Value::Int(5)])
+        );
+    }
+
+    #[test]
+    fn fold_sum() {
+        use lattice_parser::ast::Param;
+        // fold([1, 2, 3, 4], 0, fn(acc, x) -> acc + x) => 10
+        let expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("fold".into()))),
+            args: vec![
+                s(Expr::Array(vec![int(1), int(2), int(3), int(4)])),
+                int(0),
+                s(Expr::Lambda {
+                    params: vec![
+                        Param {
+                            name: "acc".into(),
+                            type_expr: Spanned::dummy(lattice_parser::ast::TypeExpr::Named("Int".into())),
+                        },
+                        Param {
+                            name: "x".into(),
+                            type_expr: Spanned::dummy(lattice_parser::ast::TypeExpr::Named("Int".into())),
+                        },
+                    ],
+                    body: Box::new(s(binop(
+                        s(Expr::Ident("acc".into())),
+                        BinOp::Add,
+                        s(Expr::Ident("x".into())),
+                    ))),
+                }),
+            ],
+        };
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(10));
     }
 
     #[test]
