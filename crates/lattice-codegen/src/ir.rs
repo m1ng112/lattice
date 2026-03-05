@@ -78,6 +78,10 @@ pub enum Instruction {
     TestConstructor(String),
     /// Extract the nth field from a constructor value on top of stack.
     ExtractField(usize),
+    /// Index into an array: pops index, pops array, pushes element.
+    IndexArray,
+    /// Slice an array: pops end (or -1 for none), pops start (or -1 for none), pops array.
+    SliceArray,
 
     // ── Closures ────────────────────────────
     /// Create a closure: captures listed variables, function index, param count.

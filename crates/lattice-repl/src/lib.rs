@@ -42,13 +42,15 @@ impl Default for Repl {
 
 impl Repl {
     pub fn new() -> Self {
+        let mut interpreter = Interpreter::new();
+        interpreter.register_stdlib();
         Self {
             type_checker: TypeChecker::new(),
             context: ReplContext {
                 source: String::new(),
                 loaded_files: Vec::new(),
             },
-            interpreter: Interpreter::new(),
+            interpreter,
             pending: None,
         }
     }

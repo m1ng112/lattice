@@ -36,6 +36,92 @@ impl Interpreter {
         self.builtins.insert(name, Box::new(f));
     }
 
+    /// Register standard library built-in functions.
+    pub fn register_stdlib(&mut self) {
+        self.register_builtin("length".into(), |args| {
+            match args.first() {
+                Some(Value::Array(arr)) => Ok(Value::Int(arr.len() as i64)),
+                Some(Value::String(s)) => Ok(Value::Int(s.len() as i64)),
+                _ => Err(CodegenError::TypeError("length requires array or string".into())),
+            }
+        });
+        self.register_builtin("head".into(), |args| {
+            match args.first() {
+                Some(Value::Array(arr)) => Ok(arr.first().cloned().unwrap_or(Value::Null)),
+                _ => Err(CodegenError::TypeError("head requires array".into())),
+            }
+        });
+        self.register_builtin("tail".into(), |args| {
+            match args.first() {
+                Some(Value::Array(arr)) if !arr.is_empty() => {
+                    Ok(Value::Array(arr[1..].to_vec()))
+                }
+                Some(Value::Array(_)) => Ok(Value::Array(vec![])),
+                _ => Err(CodegenError::TypeError("tail requires array".into())),
+            }
+        });
+        self.register_builtin("push".into(), |args| {
+            if args.len() != 2 {
+                return Err(CodegenError::TypeError("push requires 2 arguments".into()));
+            }
+            match &args[0] {
+                Value::Array(arr) => {
+                    let mut new_arr = arr.clone();
+                    new_arr.push(args[1].clone());
+                    Ok(Value::Array(new_arr))
+                }
+                _ => Err(CodegenError::TypeError("push requires array as first argument".into())),
+            }
+        });
+        self.register_builtin("reverse".into(), |args| {
+            match args.first() {
+                Some(Value::Array(arr)) => {
+                    let mut rev = arr.clone();
+                    rev.reverse();
+                    Ok(Value::Array(rev))
+                }
+                _ => Err(CodegenError::TypeError("reverse requires array".into())),
+            }
+        });
+        self.register_builtin("contains".into(), |args| {
+            if args.len() != 2 {
+                return Err(CodegenError::TypeError("contains requires 2 arguments".into()));
+            }
+            match &args[0] {
+                Value::Array(arr) => Ok(Value::Bool(arr.contains(&args[1]))),
+                _ => Err(CodegenError::TypeError("contains requires array".into())),
+            }
+        });
+        self.register_builtin("range".into(), |args| {
+            match (args.first(), args.get(1)) {
+                (Some(Value::Int(start)), Some(Value::Int(end))) => {
+                    let arr: Vec<Value> = (*start..*end).map(Value::Int).collect();
+                    Ok(Value::Array(arr))
+                }
+                _ => Err(CodegenError::TypeError("range requires two int arguments".into())),
+            }
+        });
+        self.register_builtin("toString".into(), |args| {
+            match args.first() {
+                Some(Value::Int(n)) => Ok(Value::String(n.to_string())),
+                Some(Value::Float(f)) => Ok(Value::String(f.to_string())),
+                Some(Value::Bool(b)) => Ok(Value::String(b.to_string())),
+                Some(Value::String(s)) => Ok(Value::String(s.clone())),
+                Some(Value::Null) => Ok(Value::String("null".to_string())),
+                _ => Ok(Value::String("<value>".to_string())),
+            }
+        });
+        self.register_builtin("print".into(), |args| {
+            if let Some(val) = args.first() {
+                match val {
+                    Value::String(s) => eprintln!("{s}"),
+                    other => eprintln!("{other:?}"),
+                }
+            }
+            Ok(Value::Null)
+        });
+    }
+
     /// Execute a compiled program, returning the final value.
     pub fn execute(&mut self, program: &Program) -> Result<Value, CodegenError> {
         let entry = program.functions[program.entry].clone();
@@ -427,6 +513,32 @@ impl Interpreter {
                         _ => self.stack.push(Value::Null),
                     }
                 }
+                Instruction::IndexArray => {
+                    let index = self.pop()?;
+                    let array = self.pop()?;
+                    match (array, index) {
+                        (Value::Array(arr), Value::Int(i)) => {
+                            let idx = if i < 0 { (arr.len() as i64 + i) as usize } else { i as usize };
+                            self.stack.push(arr.get(idx).cloned().unwrap_or(Value::Null));
+                        }
+                        _ => return Err(CodegenError::TypeError("index requires array and int".into())),
+                    }
+                }
+                Instruction::SliceArray => {
+                    let end = self.pop()?;
+                    let start = self.pop()?;
+                    let array = self.pop()?;
+                    match array {
+                        Value::Array(arr) => {
+                            let s = match start { Value::Int(n) if n >= 0 => n as usize, _ => 0 };
+                            let e = match end { Value::Int(n) if n >= 0 => n as usize, _ => arr.len() };
+                            let e = e.min(arr.len());
+                            let s = s.min(e);
+                            self.stack.push(Value::Array(arr[s..e].to_vec()));
+                        }
+                        _ => return Err(CodegenError::TypeError("slice requires array".into())),
+                    }
+                }
 
                 // ── Closures ───────────────────────
                 Instruction::MakeClosure(func_idx, captures) => {
@@ -806,6 +918,32 @@ impl Interpreter {
                         _ => self.stack.push(Value::Null),
                     }
                 }
+                Instruction::IndexArray => {
+                    let index = self.pop()?;
+                    let array = self.pop()?;
+                    match (array, index) {
+                        (Value::Array(arr), Value::Int(i)) => {
+                            let idx = if i < 0 { (arr.len() as i64 + i) as usize } else { i as usize };
+                            self.stack.push(arr.get(idx).cloned().unwrap_or(Value::Null));
+                        }
+                        _ => return Err(CodegenError::TypeError("index requires array and int".into())),
+                    }
+                }
+                Instruction::SliceArray => {
+                    let end = self.pop()?;
+                    let start = self.pop()?;
+                    let array = self.pop()?;
+                    match array {
+                        Value::Array(arr) => {
+                            let s = match start { Value::Int(n) if n >= 0 => n as usize, _ => 0 };
+                            let e = match end { Value::Int(n) if n >= 0 => n as usize, _ => arr.len() };
+                            let e = e.min(arr.len());
+                            let s = s.min(e);
+                            self.stack.push(Value::Array(arr[s..e].to_vec()));
+                        }
+                        _ => return Err(CodegenError::TypeError("slice requires array".into())),
+                    }
+                }
 
                 // ── Closures ───────────────────────
                 Instruction::MakeClosure(func_idx, captures) => {
@@ -965,6 +1103,7 @@ pub fn eval_expr(expr: &lattice_parser::ast::Expr) -> Result<Value, CodegenError
     let mut compiler = crate::compiler::Compiler::new();
     let program = compiler.compile_expression(expr)?;
     let mut interp = Interpreter::new();
+    interp.register_stdlib();
     interp.execute(&program)
 }
 
@@ -1329,6 +1468,79 @@ mod tests {
             }),
         ]);
         assert_eq!(eval_expr(&expr).unwrap(), Value::Int(10));
+    }
+
+    // ── Array operations ────────────────────
+
+    #[test]
+    fn array_index() {
+        let expr = Expr::Index {
+            expr: Box::new(s(Expr::Array(vec![int(10), int(20), int(30)]))),
+            index: Box::new(int(1)),
+        };
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(20));
+    }
+
+    #[test]
+    fn array_index_negative() {
+        let expr = Expr::Index {
+            expr: Box::new(s(Expr::Array(vec![int(10), int(20), int(30)]))),
+            index: Box::new(int(-1)),
+        };
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(30));
+    }
+
+    #[test]
+    fn array_slice() {
+        let expr = Expr::Slice {
+            expr: Box::new(s(Expr::Array(vec![int(1), int(2), int(3), int(4)]))),
+            start: Some(Box::new(int(1))),
+            end: Some(Box::new(int(3))),
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::Array(vec![Value::Int(2), Value::Int(3)])
+        );
+    }
+
+    #[test]
+    fn builtin_length() {
+        let expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("length".into()))),
+            args: vec![s(Expr::Array(vec![int(1), int(2), int(3)]))],
+        };
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(3));
+    }
+
+    #[test]
+    fn builtin_head_tail() {
+        let arr = Expr::Array(vec![int(10), int(20), int(30)]);
+        let head_expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("head".into()))),
+            args: vec![s(arr.clone())],
+        };
+        assert_eq!(eval_expr(&head_expr).unwrap(), Value::Int(10));
+
+        let tail_expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("tail".into()))),
+            args: vec![s(arr)],
+        };
+        assert_eq!(
+            eval_expr(&tail_expr).unwrap(),
+            Value::Array(vec![Value::Int(20), Value::Int(30)])
+        );
+    }
+
+    #[test]
+    fn builtin_reverse() {
+        let expr = Expr::Call {
+            func: Box::new(s(Expr::Ident("reverse".into()))),
+            args: vec![s(Expr::Array(vec![int(1), int(2), int(3)]))],
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::Array(vec![Value::Int(3), Value::Int(2), Value::Int(1)])
+        );
     }
 
     #[test]

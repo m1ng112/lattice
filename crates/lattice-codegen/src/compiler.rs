@@ -254,6 +254,27 @@ impl Compiler {
                 }
             }
 
+            ast::Expr::Index { expr, index } => {
+                self.compile_expr(&expr.node, instructions)?;
+                self.compile_expr(&index.node, instructions)?;
+                instructions.push(Instruction::IndexArray);
+            }
+
+            ast::Expr::Slice { expr, start, end } => {
+                self.compile_expr(&expr.node, instructions)?;
+                if let Some(s) = start {
+                    self.compile_expr(&s.node, instructions)?;
+                } else {
+                    instructions.push(Instruction::PushInt(-1));
+                }
+                if let Some(e) = end {
+                    self.compile_expr(&e.node, instructions)?;
+                } else {
+                    instructions.push(Instruction::PushInt(-1));
+                }
+                instructions.push(Instruction::SliceArray);
+            }
+
             ast::Expr::Match { expr, arms } => {
                 self.compile_match(expr, arms, instructions)?;
             }
