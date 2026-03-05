@@ -1,6 +1,7 @@
 use crate::error::CodegenError;
 use crate::ir::*;
 use lattice_parser::ast;
+use lattice_parser::ast::Spanned;
 
 pub struct Compiler {
     functions: Vec<Function>,
@@ -62,13 +63,16 @@ impl Compiler {
         self.compile_expr(expr, &mut instructions)?;
         instructions.push(Instruction::Return);
 
+        let entry = self.functions.len();
+        self.functions.push(Function {
+            name: "__expr__".into(),
+            params: vec![],
+            instructions,
+        });
+
         Ok(Program {
-            functions: vec![Function {
-                name: "__expr__".into(),
-                params: vec![],
-                instructions,
-            }],
-            entry: 0,
+            functions: std::mem::take(&mut self.functions),
+            entry,
         })
     }
 
@@ -168,15 +172,18 @@ impl Compiler {
             }
 
             ast::Expr::Call { func, args } => {
-                for arg in args {
-                    self.compile_expr(&arg.node, instructions)?;
-                }
                 if let ast::Expr::Ident(name) = &func.node {
+                    for arg in args {
+                        self.compile_expr(&arg.node, instructions)?;
+                    }
                     instructions.push(Instruction::Call(name.clone(), args.len()));
                 } else {
-                    return Err(CodegenError::Unsupported(
-                        "non-identifier function calls".to_string(),
-                    ));
+                    // Non-identifier call: compile callee first, then args, then CallClosure
+                    self.compile_expr(&func.node, instructions)?;
+                    for arg in args {
+                        self.compile_expr(&arg.node, instructions)?;
+                    }
+                    instructions.push(Instruction::CallClosure(args.len()));
                 }
             }
 
@@ -202,13 +209,14 @@ impl Compiler {
 
             // Pipeline: a |> f  =>  f(a)
             ast::Expr::Pipeline { left, right } => {
-                self.compile_expr(&left.node, instructions)?;
                 if let ast::Expr::Ident(name) = &right.node {
+                    self.compile_expr(&left.node, instructions)?;
                     instructions.push(Instruction::Call(name.clone(), 1));
                 } else {
-                    return Err(CodegenError::Unsupported(
-                        "non-identifier pipeline target".to_string(),
-                    ));
+                    // Pipeline to lambda/closure: closure first, then arg
+                    self.compile_expr(&right.node, instructions)?;
+                    self.compile_expr(&left.node, instructions)?;
+                    instructions.push(Instruction::CallClosure(1));
                 }
             }
 
@@ -246,11 +254,180 @@ impl Compiler {
                 }
             }
 
+            ast::Expr::Match { expr, arms } => {
+                self.compile_match(expr, arms, instructions)?;
+            }
+
+            ast::Expr::Lambda { params, body } => {
+                self.compile_lambda(params, body, instructions)?;
+            }
+
             _ => {
                 return Err(CodegenError::Unsupported(format!("{expr:?}")));
             }
         }
 
+        Ok(())
+    }
+
+    fn compile_match(
+        &mut self,
+        scrutinee: &Spanned<ast::Expr>,
+        arms: &[ast::MatchArm],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), CodegenError> {
+        // Compile scrutinee → stack: [scrutinee]
+        self.compile_expr(&scrutinee.node, instructions)?;
+
+        let mut end_jumps = Vec::new();
+
+        for arm in arms {
+            // Dup scrutinee for pattern testing → stack: [scrutinee, dup]
+            instructions.push(Instruction::Dup);
+
+            // Pattern test: peeks at dup, pushes bool → stack: [scrutinee, dup, bool]
+            self.compile_pattern_test(&arm.pattern.node, instructions)?;
+
+            let next_arm = instructions.len();
+            // JumpIfFalse pops bool → stack: [scrutinee, dup]
+            instructions.push(Instruction::JumpIfFalse(0)); // placeholder
+
+            // Pattern matched — bind variables (consumes dup) → stack: [scrutinee]
+            self.compile_pattern_bind(&arm.pattern.node, instructions)?;
+
+            // Compile arm body → stack: [scrutinee, result]
+            self.compile_expr(&arm.body.node, instructions)?;
+
+            // Swap result under scrutinee, pop scrutinee → stack: [result]
+            instructions.push(Instruction::Swap);
+            instructions.push(Instruction::Pop);
+
+            end_jumps.push(instructions.len());
+            instructions.push(Instruction::Jump(0)); // placeholder: jump to end
+
+            let next = instructions.len();
+            instructions[next_arm] = Instruction::JumpIfFalse(next);
+            // Pattern didn't match — pop the dup → stack: [scrutinee]
+            instructions.push(Instruction::Pop);
+        }
+
+        // No arm matched — pop scrutinee, push null
+        instructions.push(Instruction::Pop);
+        instructions.push(Instruction::PushNull);
+
+        let end = instructions.len();
+        for jump in end_jumps {
+            instructions[jump] = Instruction::Jump(end);
+        }
+
+        Ok(())
+    }
+
+    /// Compile a pattern test. Stack before: [..., dup]. Stack after: [..., dup, bool].
+    /// The dup value is left on the stack for compile_pattern_bind to consume.
+    fn compile_pattern_test(
+        &mut self,
+        pattern: &ast::Pattern,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), CodegenError> {
+        match pattern {
+            ast::Pattern::Wildcard | ast::Pattern::Ident(_) => {
+                // Always matches
+                instructions.push(Instruction::PushBool(true));
+            }
+            ast::Pattern::Literal(lit) => {
+                // TestXxx peeks at the value and pushes bool
+                match &lit.node {
+                    ast::Expr::IntLit(n) => {
+                        instructions.push(Instruction::TestInt(*n));
+                    }
+                    ast::Expr::StringLit(s) => {
+                        instructions.push(Instruction::TestString(s.clone()));
+                    }
+                    ast::Expr::BoolLit(b) => {
+                        instructions.push(Instruction::TestBool(*b));
+                    }
+                    _ => {
+                        return Err(CodegenError::Unsupported(
+                            "complex literal in pattern".to_string(),
+                        ));
+                    }
+                }
+            }
+            ast::Pattern::Constructor(name, _) => {
+                instructions.push(Instruction::TestConstructor(name.clone()));
+            }
+            ast::Pattern::Record(_) => {
+                return Err(CodegenError::Unsupported(
+                    "record pattern matching".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_pattern_bind(
+        &mut self,
+        pattern: &ast::Pattern,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), CodegenError> {
+        match pattern {
+            ast::Pattern::Wildcard => {
+                // Pop the duped scrutinee, nothing to bind
+                instructions.push(Instruction::Pop);
+            }
+            ast::Pattern::Ident(name) => {
+                // Bind the duped scrutinee to the variable
+                instructions.push(Instruction::StoreVar(name.clone()));
+            }
+            ast::Pattern::Literal(_) => {
+                // Pop the duped scrutinee, no binding needed
+                instructions.push(Instruction::Pop);
+            }
+            ast::Pattern::Constructor(_, sub_patterns) => {
+                // Extract fields for sub-patterns
+                for (i, sub) in sub_patterns.iter().enumerate() {
+                    if let ast::Pattern::Ident(name) = &sub.node {
+                        instructions.push(Instruction::Dup);
+                        instructions.push(Instruction::ExtractField(i));
+                        instructions.push(Instruction::StoreVar(name.clone()));
+                    }
+                }
+                instructions.push(Instruction::Pop); // pop constructor value
+            }
+            ast::Pattern::Record(_) => {
+                return Err(CodegenError::Unsupported(
+                    "record pattern binding".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_lambda(
+        &mut self,
+        params: &[ast::Param],
+        body: &Spanned<ast::Expr>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), CodegenError> {
+        // Compile the lambda body as a separate function
+        let mut body_instructions = Vec::new();
+        self.compile_expr(&body.node, &mut body_instructions)?;
+        body_instructions.push(Instruction::Return);
+
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+
+        // Collect free variables (simplified: we capture all known variables)
+        let captured: Vec<String> = Vec::new(); // TODO: proper free variable analysis
+
+        let func_idx = self.functions.len();
+        self.functions.push(Function {
+            name: format!("__lambda_{func_idx}__"),
+            params: param_names,
+            instructions: body_instructions,
+        });
+
+        instructions.push(Instruction::MakeClosure(func_idx, captured));
         Ok(())
     }
 }

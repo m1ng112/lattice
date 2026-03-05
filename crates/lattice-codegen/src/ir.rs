@@ -67,6 +67,24 @@ pub enum Instruction {
     MakeArray(usize),
     MakeRecord(Vec<String>),
 
+    // ── Pattern matching ─────────────────────
+    /// Test if top of stack equals a literal int (pushes bool, doesn't pop).
+    TestInt(i64),
+    /// Test if top of stack equals a literal string (pushes bool, doesn't pop).
+    TestString(String),
+    /// Test if top of stack equals a literal bool (pushes bool, doesn't pop).
+    TestBool(bool),
+    /// Test if top of stack is a constructor with the given name (pushes bool, doesn't pop).
+    TestConstructor(String),
+    /// Extract the nth field from a constructor value on top of stack.
+    ExtractField(usize),
+
+    // ── Closures ────────────────────────────
+    /// Create a closure: captures listed variables, function index, param count.
+    MakeClosure(usize, Vec<String>),
+    /// Call a closure on top of stack with n arguments below it.
+    CallClosure(usize),
+
     // ── Debugging ───────────────────────────
     Print,
 

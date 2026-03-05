@@ -57,6 +57,38 @@ impl Interpreter {
         self.stack.pop().ok_or(CodegenError::StackUnderflow)
     }
 
+    fn call_closure_value(
+        &mut self,
+        closure: Value,
+        args: Vec<Value>,
+        program: &Program,
+    ) -> Result<Value, CodegenError> {
+        match closure {
+            Value::Object(map) => {
+                let func_idx = map
+                    .get("__closure_func_idx")
+                    .and_then(|v| v.as_int())
+                    .ok_or_else(|| CodegenError::TypeError("not a closure".into()))?
+                    as usize;
+                let callee = program
+                    .functions
+                    .get(func_idx)
+                    .ok_or_else(|| CodegenError::TypeError("invalid closure function index".into()))?
+                    .clone();
+                let saved = std::mem::take(&mut self.variables);
+                for (k, v) in &map {
+                    if let Some(name) = k.strip_prefix("__capture_") {
+                        self.variables.insert(name.to_string(), v.clone());
+                    }
+                }
+                let result = self.run_function(callee, args, program)?;
+                self.variables = saved;
+                Ok(result)
+            }
+            _ => Err(CodegenError::TypeError("not a callable value".into())),
+        }
+    }
+
     fn run_function(
         &mut self,
         func: Function,
@@ -288,6 +320,14 @@ impl Interpreter {
                         let callee = callee.clone();
                         let result = self.run_function(callee, call_args, program)?;
                         self.stack.push(result);
+                    } else if let Some(closure_val) = self.variables.get(&name)
+                        .or_else(|| old_vars.get(&name))
+                        .or_else(|| self.globals.get(&name))
+                        .cloned()
+                    {
+                        // Try calling as a closure
+                        let result = self.call_closure_value(closure_val, call_args, program)?;
+                        self.stack.push(result);
                     } else {
                         return Err(CodegenError::UndefinedVariable(name));
                     }
@@ -335,6 +375,106 @@ impl Interpreter {
                     let map: HashMap<String, Value> =
                         fields.into_iter().zip(values).collect();
                     self.stack.push(Value::Object(map));
+                }
+
+                // ── Pattern matching ────────────────
+                Instruction::TestInt(n) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = matches!(val, Value::Int(v) if v == n);
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::TestString(s) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = matches!(val, Value::String(v) if v == s);
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::TestBool(b) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = matches!(val, Value::Bool(v) if v == b);
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::TestConstructor(name) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = match val {
+                        Value::Object(map) => map.get("__constructor").map_or(false, |v| {
+                            matches!(v, Value::String(n) if n == name)
+                        }),
+                        _ => false,
+                    };
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::ExtractField(idx) => {
+                    let val = self.pop()?;
+                    match val {
+                        Value::Object(map) => {
+                            let field_val = map
+                                .get(&format!("__{idx}"))
+                                .or_else(|| {
+                                    let mut keys: Vec<_> = map.keys()
+                                        .filter(|k| !k.starts_with("__"))
+                                        .collect();
+                                    keys.sort();
+                                    keys.get(*idx).and_then(|k| map.get(*k))
+                                })
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            self.stack.push(field_val);
+                        }
+                        Value::Array(arr) => {
+                            let field_val = arr.get(*idx).cloned().unwrap_or(Value::Null);
+                            self.stack.push(field_val);
+                        }
+                        _ => self.stack.push(Value::Null),
+                    }
+                }
+
+                // ── Closures ───────────────────────
+                Instruction::MakeClosure(func_idx, captures) => {
+                    let mut env: HashMap<String, Value> = HashMap::new();
+                    for name in captures {
+                        if let Some(val) = self.variables.get(name)
+                            .or_else(|| old_vars.get(name))
+                            .or_else(|| self.globals.get(name))
+                        {
+                            env.insert(name.clone(), val.clone());
+                        }
+                    }
+                    let mut closure_map = HashMap::new();
+                    closure_map.insert("__closure_func_idx".to_string(), Value::Int(*func_idx as i64));
+                    for (k, v) in env {
+                        closure_map.insert(format!("__capture_{k}"), v);
+                    }
+                    self.stack.push(Value::Object(closure_map));
+                }
+                Instruction::CallClosure(arg_count) => {
+                    let arg_count = *arg_count;
+                    let mut call_args = Vec::with_capacity(arg_count);
+                    for _ in 0..arg_count {
+                        call_args.push(self.pop()?);
+                    }
+                    call_args.reverse();
+                    let closure = self.pop()?;
+                    match closure {
+                        Value::Object(map) => {
+                            let func_idx = map.get("__closure_func_idx")
+                                .and_then(|v| v.as_int())
+                                .ok_or_else(|| CodegenError::TypeError("not a closure".into()))? as usize;
+                            let callee = program.functions.get(func_idx)
+                                .ok_or_else(|| CodegenError::TypeError("invalid closure function index".into()))?
+                                .clone();
+                            // Inject captured variables
+                            let saved = std::mem::take(&mut self.variables);
+                            for (k, v) in &map {
+                                if let Some(name) = k.strip_prefix("__capture_") {
+                                    self.variables.insert(name.to_string(), v.clone());
+                                }
+                            }
+                            let result = self.run_function(callee, call_args, program)?;
+                            self.variables = saved;
+                            self.stack.push(result);
+                        }
+                        _ => return Err(CodegenError::TypeError("not a closure".into())),
+                    }
                 }
 
                 // ── Debugging ───────────────────────
@@ -564,6 +704,12 @@ impl Interpreter {
                         let callee = callee.clone();
                         let result = self.run_function(callee, call_args, program)?;
                         self.stack.push(result);
+                    } else if let Some(closure_val) = self.variables.get(&name)
+                        .or_else(|| self.globals.get(&name))
+                        .cloned()
+                    {
+                        let result = self.call_closure_value(closure_val, call_args, program)?;
+                        self.stack.push(result);
                     } else {
                         return Err(CodegenError::UndefinedVariable(name));
                     }
@@ -610,6 +756,104 @@ impl Interpreter {
                         fields.into_iter().zip(values).collect();
                     self.stack.push(Value::Object(map));
                 }
+                // ── Pattern matching ────────────────
+                Instruction::TestInt(n) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = matches!(val, Value::Int(v) if v == n);
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::TestString(s) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = matches!(val, Value::String(v) if v == s);
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::TestBool(b) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = matches!(val, Value::Bool(v) if v == b);
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::TestConstructor(name) => {
+                    let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
+                    let matches = match val {
+                        Value::Object(map) => map.get("__constructor").map_or(false, |v| {
+                            matches!(v, Value::String(n) if n == name)
+                        }),
+                        _ => false,
+                    };
+                    self.stack.push(Value::Bool(matches));
+                }
+                Instruction::ExtractField(idx) => {
+                    let val = self.pop()?;
+                    match val {
+                        Value::Object(map) => {
+                            let field_val = map
+                                .get(&format!("__{idx}"))
+                                .or_else(|| {
+                                    let mut keys: Vec<_> = map.keys()
+                                        .filter(|k| !k.starts_with("__"))
+                                        .collect();
+                                    keys.sort();
+                                    keys.get(*idx).and_then(|k| map.get(*k))
+                                })
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            self.stack.push(field_val);
+                        }
+                        Value::Array(arr) => {
+                            let field_val = arr.get(*idx).cloned().unwrap_or(Value::Null);
+                            self.stack.push(field_val);
+                        }
+                        _ => self.stack.push(Value::Null),
+                    }
+                }
+
+                // ── Closures ───────────────────────
+                Instruction::MakeClosure(func_idx, captures) => {
+                    let mut env: HashMap<String, Value> = HashMap::new();
+                    for name in captures {
+                        if let Some(val) = self.variables.get(name)
+                            .or_else(|| self.globals.get(name))
+                        {
+                            env.insert(name.clone(), val.clone());
+                        }
+                    }
+                    let mut closure_map = HashMap::new();
+                    closure_map.insert("__closure_func_idx".to_string(), Value::Int(*func_idx as i64));
+                    for (k, v) in env {
+                        closure_map.insert(format!("__capture_{k}"), v);
+                    }
+                    self.stack.push(Value::Object(closure_map));
+                }
+                Instruction::CallClosure(arg_count) => {
+                    let arg_count = *arg_count;
+                    let mut call_args = Vec::with_capacity(arg_count);
+                    for _ in 0..arg_count {
+                        call_args.push(self.pop()?);
+                    }
+                    call_args.reverse();
+                    let closure = self.pop()?;
+                    match closure {
+                        Value::Object(map) => {
+                            let func_idx = map.get("__closure_func_idx")
+                                .and_then(|v| v.as_int())
+                                .ok_or_else(|| CodegenError::TypeError("not a closure".into()))? as usize;
+                            let callee = program.functions.get(func_idx)
+                                .ok_or_else(|| CodegenError::TypeError("invalid closure function index".into()))?
+                                .clone();
+                            let saved = std::mem::take(&mut self.variables);
+                            for (k, v) in &map {
+                                if let Some(name) = k.strip_prefix("__capture_") {
+                                    self.variables.insert(name.to_string(), v.clone());
+                                }
+                            }
+                            let result = self.run_function(callee, call_args, program)?;
+                            self.variables = saved;
+                            self.stack.push(result);
+                        }
+                        _ => return Err(CodegenError::TypeError("not a closure".into())),
+                    }
+                }
+
                 Instruction::Print => {
                     if let Some(val) = self.stack.last() {
                         eprintln!("[print] {val:?}");
@@ -991,6 +1235,100 @@ mod tests {
             eval_expr(&expr).unwrap(),
             Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)])
         );
+    }
+
+    // ── Match expression ────────────────────
+
+    #[test]
+    fn match_literal_int() {
+        use lattice_parser::ast::{MatchArm, Pattern};
+        let expr = Expr::Match {
+            expr: Box::new(int(42)),
+            arms: vec![
+                MatchArm {
+                    pattern: Spanned::dummy(Pattern::Literal(int(1))),
+                    guard: None,
+                    body: s(Expr::StringLit("one".into())),
+                },
+                MatchArm {
+                    pattern: Spanned::dummy(Pattern::Literal(int(42))),
+                    guard: None,
+                    body: s(Expr::StringLit("forty-two".into())),
+                },
+            ],
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::String("forty-two".into())
+        );
+    }
+
+    #[test]
+    fn match_wildcard() {
+        use lattice_parser::ast::{MatchArm, Pattern};
+        let expr = Expr::Match {
+            expr: Box::new(int(99)),
+            arms: vec![
+                MatchArm {
+                    pattern: Spanned::dummy(Pattern::Literal(int(1))),
+                    guard: None,
+                    body: s(Expr::StringLit("one".into())),
+                },
+                MatchArm {
+                    pattern: Spanned::dummy(Pattern::Wildcard),
+                    guard: None,
+                    body: s(Expr::StringLit("other".into())),
+                },
+            ],
+        };
+        assert_eq!(
+            eval_expr(&expr).unwrap(),
+            Value::String("other".into())
+        );
+    }
+
+    #[test]
+    fn match_ident_binding() {
+        use lattice_parser::ast::{MatchArm, Pattern};
+        let expr = Expr::Match {
+            expr: Box::new(int(7)),
+            arms: vec![MatchArm {
+                pattern: Spanned::dummy(Pattern::Ident("x".into())),
+                guard: None,
+                body: s(binop(s(Expr::Ident("x".into())), BinOp::Mul, int(2))),
+            }],
+        };
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(14));
+    }
+
+    // ── Lambda/closure ─────────────────────
+
+    #[test]
+    fn lambda_basic() {
+        use lattice_parser::ast::Param;
+        // let double = fn(x) -> x * 2; double(5)
+        let expr = Expr::Block(vec![
+            s(Expr::Let {
+                name: "double".into(),
+                type_ann: None,
+                value: Box::new(s(Expr::Lambda {
+                    params: vec![Param {
+                        name: "x".into(),
+                        type_expr: Spanned::dummy(lattice_parser::ast::TypeExpr::Named("Int".into())),
+                    }],
+                    body: Box::new(s(binop(
+                        s(Expr::Ident("x".into())),
+                        BinOp::Mul,
+                        int(2),
+                    ))),
+                })),
+            }),
+            s(Expr::Call {
+                func: Box::new(s(Expr::Ident("double".into()))),
+                args: vec![int(5)],
+            }),
+        ]);
+        assert_eq!(eval_expr(&expr).unwrap(), Value::Int(10));
     }
 
     // ── Error cases ─────────────────────────
