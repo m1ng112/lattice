@@ -6,6 +6,8 @@ use std::collections::HashMap;
 pub struct Interpreter {
     stack: Vec<Value>,
     variables: HashMap<String, Value>,
+    /// Persistent global variables that survive across multiple executions (for REPL).
+    globals: HashMap<String, Value>,
     builtins: HashMap<String, Box<dyn Fn(Vec<Value>) -> Result<Value, CodegenError>>>,
 }
 
@@ -20,6 +22,7 @@ impl Interpreter {
         Self {
             stack: Vec::new(),
             variables: HashMap::new(),
+            globals: HashMap::new(),
             builtins: HashMap::new(),
         }
     }
@@ -37,6 +40,17 @@ impl Interpreter {
     pub fn execute(&mut self, program: &Program) -> Result<Value, CodegenError> {
         let entry = program.functions[program.entry].clone();
         self.run_function(entry, vec![], program)
+    }
+
+    /// Execute a compiled program, persisting top-level variables for REPL use.
+    pub fn execute_persistent(&mut self, program: &Program) -> Result<Value, CodegenError> {
+        let entry = program.functions[program.entry].clone();
+        self.run_function_persistent(entry, program)
+    }
+
+    /// Returns a reference to the persistent global variables.
+    pub fn globals(&self) -> &HashMap<String, Value> {
+        &self.globals
     }
 
     fn pop(&mut self) -> Result<Value, CodegenError> {
@@ -71,6 +85,7 @@ impl Interpreter {
                         .variables
                         .get(name)
                         .or_else(|| old_vars.get(name))
+                        .or_else(|| self.globals.get(name))
                         .ok_or_else(|| CodegenError::UndefinedVariable(name.clone()))?
                         .clone();
                     self.stack.push(val);
@@ -337,6 +352,276 @@ impl Interpreter {
         }
 
         self.variables = old_vars;
+        self.stack.pop().ok_or(CodegenError::StackUnderflow)
+    }
+
+    /// Like run_function but uses globals as the variable base and persists new bindings back.
+    fn run_function_persistent(
+        &mut self,
+        func: Function,
+        program: &Program,
+    ) -> Result<Value, CodegenError> {
+        // Use globals as the starting variable environment
+        self.variables = self.globals.clone();
+
+        let mut pc = 0;
+        while pc < func.instructions.len() {
+            match &func.instructions[pc] {
+                Instruction::PushInt(n) => self.stack.push(Value::Int(*n)),
+                Instruction::PushFloat(f) => self.stack.push(Value::Float(*f)),
+                Instruction::PushBool(b) => self.stack.push(Value::Bool(*b)),
+                Instruction::PushString(s) => self.stack.push(Value::String(s.clone())),
+                Instruction::PushNull => self.stack.push(Value::Null),
+                Instruction::LoadVar(name) => {
+                    let val = self
+                        .variables
+                        .get(name)
+                        .ok_or_else(|| CodegenError::UndefinedVariable(name.clone()))?
+                        .clone();
+                    self.stack.push(val);
+                }
+                Instruction::StoreVar(name) => {
+                    let val = self.pop()?;
+                    self.variables.insert(name.clone(), val);
+                }
+                Instruction::Add => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(arith_add(a, b)?);
+                }
+                Instruction::Sub => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(arith_sub(a, b)?);
+                }
+                Instruction::Mul => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(arith_mul(a, b)?);
+                }
+                Instruction::Div => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(arith_div(a, b)?);
+                }
+                Instruction::Mod => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(arith_mod(a, b)?);
+                }
+                Instruction::Concat => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    match (a, b) {
+                        (Value::String(x), Value::String(y)) => {
+                            self.stack.push(Value::String(format!("{x}{y}")));
+                        }
+                        (Value::Array(mut x), Value::Array(y)) => {
+                            x.extend(y);
+                            self.stack.push(Value::Array(x));
+                        }
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "++ requires string or array operands".into(),
+                            ))
+                        }
+                    }
+                }
+                Instruction::Neg => {
+                    let a = self.pop()?;
+                    let result = match a {
+                        Value::Int(x) => Value::Int(-x),
+                        Value::Float(x) => Value::Float(-x),
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "negation requires numeric operand".into(),
+                            ))
+                        }
+                    };
+                    self.stack.push(result);
+                }
+                Instruction::Eq => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Value::Bool(values_eq(&a, &b)));
+                }
+                Instruction::Neq => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Value::Bool(!values_eq(&a, &b)));
+                }
+                Instruction::Lt => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Value::Bool(compare_values(&a, &b)? < 0));
+                }
+                Instruction::Gt => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Value::Bool(compare_values(&a, &b)? > 0));
+                }
+                Instruction::Leq => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Value::Bool(compare_values(&a, &b)? <= 0));
+                }
+                Instruction::Geq => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    self.stack.push(Value::Bool(compare_values(&a, &b)? >= 0));
+                }
+                Instruction::And => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    match (a, b) {
+                        (Value::Bool(x), Value::Bool(y)) => {
+                            self.stack.push(Value::Bool(x && y));
+                        }
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "logical AND requires bool operands".into(),
+                            ))
+                        }
+                    }
+                }
+                Instruction::Or => {
+                    let b = self.pop()?;
+                    let a = self.pop()?;
+                    match (a, b) {
+                        (Value::Bool(x), Value::Bool(y)) => {
+                            self.stack.push(Value::Bool(x || y));
+                        }
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "logical OR requires bool operands".into(),
+                            ))
+                        }
+                    }
+                }
+                Instruction::Not => {
+                    let a = self.pop()?;
+                    match a {
+                        Value::Bool(x) => self.stack.push(Value::Bool(!x)),
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "logical NOT requires bool operand".into(),
+                            ))
+                        }
+                    }
+                }
+                Instruction::Dup => {
+                    let val = self
+                        .stack
+                        .last()
+                        .ok_or(CodegenError::StackUnderflow)?
+                        .clone();
+                    self.stack.push(val);
+                }
+                Instruction::Pop => {
+                    self.pop()?;
+                }
+                Instruction::Swap => {
+                    let len = self.stack.len();
+                    if len < 2 {
+                        return Err(CodegenError::StackUnderflow);
+                    }
+                    self.stack.swap(len - 1, len - 2);
+                }
+                Instruction::Jump(target) => {
+                    pc = *target;
+                    continue;
+                }
+                Instruction::JumpIfFalse(target) => {
+                    let val = self.pop()?;
+                    match val {
+                        Value::Bool(false) => {
+                            pc = *target;
+                            continue;
+                        }
+                        Value::Bool(true) => {}
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "conditional requires bool value".into(),
+                            ))
+                        }
+                    }
+                }
+                Instruction::Call(name, arg_count) => {
+                    let name = name.clone();
+                    let arg_count = *arg_count;
+                    let mut call_args = Vec::with_capacity(arg_count);
+                    for _ in 0..arg_count {
+                        call_args.push(self.pop()?);
+                    }
+                    call_args.reverse();
+                    let is_builtin = self.builtins.contains_key(&name);
+                    if is_builtin {
+                        let result = (self.builtins[&name])(call_args)?;
+                        self.stack.push(result);
+                    } else if let Some(callee) =
+                        program.functions.iter().find(|f| f.name == name)
+                    {
+                        let callee = callee.clone();
+                        let result = self.run_function(callee, call_args, program)?;
+                        self.stack.push(result);
+                    } else {
+                        return Err(CodegenError::UndefinedVariable(name));
+                    }
+                }
+                Instruction::Return => break,
+                Instruction::GetField(name) => {
+                    let val = self.pop()?;
+                    match val {
+                        Value::Object(map) => {
+                            let field_val = map
+                                .get(name)
+                                .ok_or_else(|| {
+                                    CodegenError::TypeError(format!(
+                                        "no field '{name}' in record"
+                                    ))
+                                })?
+                                .clone();
+                            self.stack.push(field_val);
+                        }
+                        _ => {
+                            return Err(CodegenError::TypeError(
+                                "field access on non-record".into(),
+                            ))
+                        }
+                    }
+                }
+                Instruction::MakeArray(count) => {
+                    let count = *count;
+                    let mut elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        elements.push(self.pop()?);
+                    }
+                    elements.reverse();
+                    self.stack.push(Value::Array(elements));
+                }
+                Instruction::MakeRecord(fields) => {
+                    let fields = fields.clone();
+                    let mut values = Vec::with_capacity(fields.len());
+                    for _ in 0..fields.len() {
+                        values.push(self.pop()?);
+                    }
+                    values.reverse();
+                    let map: HashMap<String, Value> =
+                        fields.into_iter().zip(values).collect();
+                    self.stack.push(Value::Object(map));
+                }
+                Instruction::Print => {
+                    if let Some(val) = self.stack.last() {
+                        eprintln!("[print] {val:?}");
+                    }
+                }
+                Instruction::Nop => {}
+            }
+            pc += 1;
+        }
+
+        // Persist all variables back to globals
+        self.globals = std::mem::take(&mut self.variables);
         self.stack.pop().ok_or(CodegenError::StackUnderflow)
     }
 }

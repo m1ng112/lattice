@@ -32,6 +32,7 @@ impl Compiler {
                 ast::Item::LetBinding(binding) => {
                     self.compile_expr(&binding.value.node, &mut main_instructions)?;
                     main_instructions.push(Instruction::StoreVar(binding.name.clone()));
+                    main_instructions.push(Instruction::PushNull);
                 }
                 _ => {} // Skip graphs, types, modules, models, meta for now
             }

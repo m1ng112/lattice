@@ -1,4 +1,5 @@
-use lattice_codegen::interpreter;
+use lattice_codegen::compiler::Compiler;
+use lattice_codegen::interpreter::Interpreter;
 use lattice_parser::ast;
 use lattice_parser::parser;
 use lattice_runtime::node::Value;
@@ -27,6 +28,8 @@ pub enum ReplResult {
 pub struct Repl {
     type_checker: TypeChecker,
     context: ReplContext,
+    /// Persistent interpreter that retains variable bindings across lines.
+    interpreter: Interpreter,
     /// Pending multi-line input being accumulated.
     pending: Option<String>,
 }
@@ -45,6 +48,7 @@ impl Repl {
                 source: String::new(),
                 loaded_files: Vec::new(),
             },
+            interpreter: Interpreter::new(),
             pending: None,
         }
     }
@@ -117,18 +121,35 @@ impl Repl {
         if input.starts_with("let ") || input.starts_with("function ") {
             let combined = format!("{}\n{}", self.context.source, input);
             match parser::parse(&combined) {
-                Ok(program) => {
-                    self.context.source = combined;
-                    // If it's a let binding, try to evaluate the value
-                    if let Some(item) = program.last() {
-                        if let ast::Item::LetBinding(lb) = &item.node {
-                            match interpreter::eval_expr(&lb.value.node) {
-                                Ok(val) => return ReplResult::Value(format_value(&val)),
-                                Err(_) => return ReplResult::Value(format!("{} defined", lb.name)),
+                Ok(_program) => {
+                    self.context.source = combined.clone();
+                    // Compile just this line and execute persistently
+                    match parser::parse(input) {
+                        Ok(program) => {
+                            let mut compiler = Compiler::new();
+                            match compiler.compile_program(&program) {
+                                Ok(ir) => match self.interpreter.execute_persistent(&ir) {
+                                    Ok(val) if val != Value::Null => {
+                                        return ReplResult::Value(format_value(&val));
+                                    }
+                                    Ok(_) => {
+                                        // For let bindings, show the bound name
+                                        if let Some(item) = program.last() {
+                                            if let ast::Item::LetBinding(lb) = &item.node {
+                                                if let Some(val) = self.interpreter.globals().get(&lb.name) {
+                                                    return ReplResult::Value(format_value(val));
+                                                }
+                                            }
+                                        }
+                                        return ReplResult::Empty;
+                                    }
+                                    Err(e) => return ReplResult::Error(e.to_string()),
+                                },
+                                Err(e) => return ReplResult::Error(e.to_string()),
                             }
                         }
+                        Err(errors) => return ReplResult::Error(format_parse_errors(&errors)),
                     }
-                    return ReplResult::Empty;
                 }
                 Err(errors) => {
                     return ReplResult::Error(format_parse_errors(&errors));
@@ -138,10 +159,16 @@ impl Repl {
 
         // Try as an expression
         match parser::parse_expression(input) {
-            Ok(expr) => match interpreter::eval_expr(&expr) {
-                Ok(val) => ReplResult::Value(format_value(&val)),
-                Err(e) => ReplResult::Error(e.to_string()),
-            },
+            Ok(expr) => {
+                let mut compiler = Compiler::new();
+                match compiler.compile_expression(&expr) {
+                    Ok(ir) => match self.interpreter.execute_persistent(&ir) {
+                        Ok(val) => ReplResult::Value(format_value(&val)),
+                        Err(e) => ReplResult::Error(e.to_string()),
+                    },
+                    Err(e) => ReplResult::Error(e.to_string()),
+                }
+            }
             Err(errors) => ReplResult::Error(format_parse_errors(&errors)),
         }
     }
@@ -375,10 +402,18 @@ mod tests {
         let mut repl = Repl::new();
         let r1 = repl.eval_line("let x = 5");
         assert!(matches!(r1, ReplResult::Value(_)));
-        // Variable lookup in expression context requires block eval,
-        // which the REPL does per-expression. Individual var refs
-        // won't carry across eval_line calls since each call is independent.
-        // This test verifies the let binding itself evaluates.
+        // Variable persists across eval_line calls
+        let r2 = repl.eval_line("x + 3");
+        assert_eq!(r2, ReplResult::Value("8".to_string()));
+    }
+
+    #[test]
+    fn variable_shadowing() {
+        let mut repl = Repl::new();
+        repl.eval_line("let x = 10");
+        repl.eval_line("let x = 20");
+        let r = repl.eval_line("x");
+        assert_eq!(r, ReplResult::Value("20".to_string()));
     }
 
     #[test]
