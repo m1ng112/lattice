@@ -8,6 +8,8 @@ members = [
     "crates/lattice-codegen",
     "crates/lattice-cli",
     "crates/lattice-synthesizer",
+    "crates/lattice-lsp",
+    "crates/lattice-repl",
 ]
 resolver = "2"
 

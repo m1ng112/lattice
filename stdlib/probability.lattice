@@ -1,0 +1,11 @@
+-- Probability distributions
+
+function sample<T>(d: Distribution<T>, n: Int) -> List<T> {
+  pre: { n > 0 }
+  post: { length(result) = n }
+  synthesize(strategy: monte_carlo)
+}
+
+function expected_value(d: Distribution<Float64>) -> Float64 {
+  synthesize(strategy: numerical)
+}

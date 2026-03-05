@@ -21,6 +21,18 @@ pub fn parse(source: &str) -> Result<Program, Vec<ParseError>> {
     }
 }
 
+/// Parse a single Lattice expression from source text.
+pub fn parse_expression(source: &str) -> Result<Expr, Vec<ParseError>> {
+    let tokens = Lexer::new(source).tokenize();
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr(0);
+    if parser.errors.is_empty() {
+        Ok(expr)
+    } else {
+        Err(parser.errors)
+    }
+}
+
 /// A parse error with location information.
 #[derive(Debug, Clone)]
 pub struct ParseError {

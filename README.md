@@ -47,7 +47,8 @@ lattice/
 │   ├── lattice-runtime/      # Async graph execution (petgraph + tokio), profiler
 │   ├── lattice-codegen/      # Stack-based IR, compiler, interpreter, optimizer
 │   ├── lattice-synthesizer/  # AI synthesis engine, intent extractor, self-optimizer
-│   └── lattice-cli/          # CLI: parse, check, prove, fmt, compile, run, synthesize, profile
+│   └── lattice-cli/          # CLI: parse, check, prove, fmt, compile, run, synthesize, profile, doc
+├── stdlib/                   # Standard library (.lattice): core, stream, math, probability
 ├── tree-sitter-lattice/      # Tree-sitter grammar (WIP)
 └── examples/                 # Example .lattice programs
 ```
@@ -73,6 +74,10 @@ cargo run -p lattice-cli -- check examples/transfer.lattice
 # JSON output
 cargo run -p lattice-cli -- parse examples/hello.lattice --format json
 cargo run -p lattice-cli -- prove examples/transfer.lattice --format json
+
+# Generate documentation
+cargo run -p lattice-cli -- doc stdlib/
+cargo run -p lattice-cli -- doc stdlib/ --output-dir docs/
 ```
 
 ## CLI Commands
@@ -88,6 +93,7 @@ cargo run -p lattice-cli -- prove examples/transfer.lattice --format json
 | `lattice run <file>` | Execute a graph (`--trace`, `--timeout`, `--input`) |
 | `lattice synthesize <file>` | Show/run AI synthesis (`--dry-run`, `--format text\|json`) |
 | `lattice profile <file>` | Profile graph execution (`--threshold`, `--input`) |
+| `lattice doc <path>` | Generate Markdown docs (`--output-dir`) |
 
 Global flags: `-v` for verbose timing output.
 
@@ -141,7 +147,7 @@ The proof engine extracts obligations and verifies them using an arithmetic solv
 | Phase 2: Verification | Done | Proof engine, dependent types |
 | Phase 3: Graph Runtime | Done | Dataflow execution, code generation |
 | Phase 4: AI Integration | Done | LLM synthesis, self-optimization |
-| Phase 5: Ecosystem | Planned | LSP, package manager, playground |
+| Phase 5: Ecosystem | Done | Standard library, documentation generator |
 
 ## Test Suite
 
@@ -149,7 +155,7 @@ The proof engine extracts obligations and verifies them using an arithmetic solv
 cargo test --workspace
 ```
 
-267 tests across all crates:
+275 tests across all crates:
 
 | Crate | Tests | Coverage |
 |-------|-------|----------|
@@ -160,6 +166,7 @@ cargo test --workspace
 | lattice-runtime | 32 | Graph execution, scheduling, profiling, streams |
 | lattice-codegen | 41 | IR compilation, interpretation, optimization |
 | lattice-synthesizer | 31 | Synthesis engine, extraction, optimization, caching |
+| lattice-cli | 8 | Stdlib parsing, documentation generator |
 
 ## Language Spec
 

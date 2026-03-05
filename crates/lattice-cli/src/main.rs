@@ -1,3 +1,5 @@
+mod docgen;
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -95,6 +97,16 @@ enum Commands {
         #[arg(long)]
         input: Option<String>,
     },
+    /// Start interactive REPL
+    Repl,
+    /// Generate documentation for .lattice files
+    Doc {
+        /// Input file or directory path
+        path: PathBuf,
+        /// Output directory (prints to stdout if not specified)
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
 }
 
 fn read_source(path: &PathBuf) -> Result<String, String> {
@@ -160,6 +172,11 @@ async fn main() {
             threshold,
             ref input,
         } => cmd_profile(file, threshold, input.as_deref(), cli.verbose).await,
+        Commands::Repl => cmd_repl(),
+        Commands::Doc {
+            ref path,
+            ref output_dir,
+        } => cmd_doc(path, output_dir.as_ref(), cli.verbose),
     };
 
     if let Err(msg) = result {
@@ -1023,6 +1040,116 @@ async fn cmd_run(
                         msg.red(),
                     );
                 }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_doc(path: &PathBuf, output_dir: Option<&PathBuf>, verbose: bool) -> Result<(), String> {
+    let files: Vec<PathBuf> = if path.is_dir() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(|e| format!("{} Failed to read directory {}: {}\n", "error:".red().bold(), path.display(), e))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let p = entry.path();
+                if p.extension().is_some_and(|ext| ext == "lattice") {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        entries.sort();
+        entries
+    } else {
+        vec![path.clone()]
+    };
+
+    if files.is_empty() {
+        return Err(format!(
+            "{} No .lattice files found in {}\n",
+            "error:".red().bold(),
+            path.display(),
+        ));
+    }
+
+    if let Some(dir) = output_dir {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("{} Failed to create output directory: {}\n", "error:".red().bold(), e))?;
+    }
+
+    for file in &files {
+        let source = read_source(file)?;
+        let program = parse_source(&source, file, verbose)?;
+        let filename = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let doc = docgen::generate_docs(&program, &filename);
+
+        if let Some(dir) = output_dir {
+            let out_name = file
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let out_path = dir.join(format!("{}.md", out_name));
+            std::fs::write(&out_path, &doc)
+                .map_err(|e| format!("{} Failed to write {}: {}\n", "error:".red().bold(), out_path.display(), e))?;
+            eprintln!(
+                "{} Generated {}",
+                "doc:".green().bold(),
+                out_path.display(),
+            );
+        } else {
+            print!("{}", doc);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_repl() -> Result<(), String> {
+    use lattice_repl::{Repl, ReplResult};
+
+    let mut rl = rustyline::DefaultEditor::new()
+        .map_err(|e| format!("{} Failed to initialize REPL: {}\n", "error:".red().bold(), e))?;
+    let mut repl = Repl::new();
+
+    println!(
+        "{} Lattice REPL v0.1.0 — :help for commands, :quit to exit",
+        "welcome:".cyan().bold()
+    );
+
+    loop {
+        let prompt = if repl.is_multiline() {
+            "  ... > "
+        } else {
+            "lattice> "
+        };
+
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(&line);
+                match repl.eval_line(&line) {
+                    ReplResult::Quit => break,
+                    ReplResult::Value(v) => println!("{}", v.green()),
+                    ReplResult::TypeInfo(t) => println!("{} {}", "type:".cyan().bold(), t),
+                    ReplResult::ProofResult(p) => println!("{}", p),
+                    ReplResult::Loaded(msg) => println!("{} {}", "ok:".green().bold(), msg),
+                    ReplResult::Help(h) => println!("{h}"),
+                    ReplResult::Error(e) => eprintln!("{} {}", "error:".red().bold(), e),
+                    ReplResult::Empty => {}
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted
+                | rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => {
+                eprintln!("{} {}", "error:".red().bold(), e);
+                break;
             }
         }
     }

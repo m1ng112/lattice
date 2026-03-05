@@ -1,0 +1,15 @@
+-- Stream processing
+
+function map<A, B>(s: Stream<A>, f: A -> B) -> Stream<B> {
+  post: { length(result) = length(s) }
+  synthesize(strategy: lazy)
+}
+
+function filter<A>(s: Stream<A>, p: A -> Bool) -> Stream<A> {
+  post: { length(result) <= length(s) }
+  synthesize(strategy: lazy)
+}
+
+function fold<A, B>(s: Stream<A>, init: B, f: B -> A -> B) -> B {
+  synthesize(strategy: eager)
+}

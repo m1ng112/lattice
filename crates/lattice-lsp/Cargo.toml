@@ -1,0 +1,17 @@
+[package]
+name = "lattice-lsp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lattice-lsp"
+path = "src/main.rs"
+
+[dependencies]
+tower-lsp = { version = "0.20", features = ["proposed"] }
+tokio = { version = "1", features = ["full"] }
+lattice-parser = { path = "../lattice-parser" }
+lattice-proof = { path = "../lattice-proof" }
+serde.workspace = true
+serde_json.workspace = true

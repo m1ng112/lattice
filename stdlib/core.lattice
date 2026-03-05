@@ -1,0 +1,17 @@
+-- Core types and operations
+
+type Option<T> = Some<T> | None
+
+type Result<T, E> = Ok<T> | Err<E>
+
+type NonEmpty<T> = { xs ∈ List<T> | length(xs) > 0 }
+
+function unwrap_or<T>(opt: Option<T>, default: T) -> T {
+  post: { true }
+  synthesize(strategy: inline)
+}
+
+function map_option<A, B>(opt: Option<A>, f: A -> B) -> Option<B> {
+  post: { true }
+  synthesize(strategy: inline)
+}

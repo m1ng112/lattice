@@ -1,0 +1,31 @@
+-- Mathematical operations
+
+function abs(x: Int) -> Int {
+  post: { result >= 0 }
+  synthesize(strategy: inline)
+}
+
+function max(a: Int, b: Int) -> Int {
+  post: {
+    result >= a
+    result >= b
+  }
+  synthesize(strategy: inline)
+}
+
+function min(a: Int, b: Int) -> Int {
+  post: {
+    result <= a
+    result <= b
+  }
+  synthesize(strategy: inline)
+}
+
+function gcd(a: Int, b: Int) -> Int {
+  pre: {
+    a > 0
+    b > 0
+  }
+  post: { result > 0 }
+  synthesize(strategy: recursive)
+}
