@@ -35,7 +35,10 @@ impl Compiler {
                     main_instructions.push(Instruction::StoreVar(binding.name.clone()));
                     main_instructions.push(Instruction::PushNull);
                 }
-                _ => {} // Skip graphs, types, modules, models, meta for now
+                ast::Item::TypeDef(td) => {
+                    self.compile_type_def(td);
+                }
+                _ => {} // Skip graphs, modules, models, meta for now
             }
         }
 
@@ -425,6 +428,31 @@ impl Compiler {
         Ok(())
     }
 
+    /// Generate constructor functions for a sum type definition.
+    /// e.g. `type Option = Some(value: Int) | None` produces:
+    ///   fn Some(value) { MakeConstructor("Some", 1); Return }
+    ///   fn None() { MakeConstructor("None", 0); Return }
+    fn compile_type_def(&mut self, td: &ast::TypeDef) {
+        if let ast::TypeExpr::Sum(variants) = &td.body.node {
+            for variant in variants {
+                let params: Vec<String> = variant.fields.iter().map(|(n, _)| n.clone()).collect();
+                let arity = params.len();
+                let mut instructions = Vec::new();
+                // Load each parameter onto the stack in order
+                for p in &params {
+                    instructions.push(Instruction::LoadVar(p.clone()));
+                }
+                instructions.push(Instruction::MakeConstructor(variant.name.clone(), arity));
+                instructions.push(Instruction::Return);
+                self.functions.push(Function {
+                    name: variant.name.clone(),
+                    params,
+                    instructions,
+                });
+            }
+        }
+    }
+
     fn compile_lambda(
         &mut self,
         params: &[ast::Param],
@@ -730,5 +758,192 @@ mod tests {
         let instrs = &prog.functions[0].instructions;
         assert!(matches!(instrs[0], Instruction::PushInt(5)));
         assert!(matches!(instrs[1], Instruction::Call(_, 1)));
+    }
+
+    #[test]
+    fn compile_sum_type_constructors() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            type Option = Some(value: Int) | None
+            let x = Some(42)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+
+        // Verify constructor functions are generated
+        let func_names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(func_names.contains(&"Some"), "functions: {func_names:?}");
+        assert!(func_names.contains(&"None"), "functions: {func_names:?}");
+
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(
+            interp.globals().get("x").cloned(),
+            Some(Value::Constructor {
+                name: "Some".into(),
+                fields: vec![Value::Int(42)],
+            })
+        );
+    }
+
+    #[test]
+    fn compile_sum_type_match() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            type Option = Some(value: Int) | None
+            function unwrap_or(opt: Option, default: Int) {
+                match opt {
+                    Some(v) -> v
+                    None -> default
+                }
+            }
+            let result = unwrap_or(Some(42), 0)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(42)));
+    }
+
+    #[test]
+    fn compile_simple_function_call() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        // First test: does a simple function call work?
+        let source = r#"
+            function double(n: Int) {
+                n * 2
+            }
+            let result = double(5)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(10)));
+    }
+
+    #[test]
+    fn compile_recursive_factorial() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            function factorial(n: Int) {
+                if n <= 1 then 1 else n * factorial(n - 1)
+            }
+            let result = factorial(5)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(120)));
+    }
+
+    #[test]
+    fn compile_recursive_fibonacci() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            function fib(n: Int) {
+                if n <= 1 then n else fib(n - 1) + fib(n - 2)
+            }
+            let result = fib(10)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(55)));
+    }
+
+    #[test]
+    fn compile_mutual_recursion() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            function is_even(n: Int) {
+                if n == 0 then true else is_odd(n - 1)
+            }
+            function is_odd(n: Int) {
+                if n == 0 then false else is_even(n - 1)
+            }
+            let result = is_even(4)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Bool(true)));
+    }
+
+    #[test]
+    fn compile_recursive_list_sum() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            type List = Cons(head: Int, tail: List) | Nil
+            function sum_list(lst: List) {
+                match lst {
+                    Cons(h, t) -> h + sum_list(t)
+                    Nil -> 0
+                }
+            }
+            let mylist = Cons(1, Cons(2, Cons(3, Nil())))
+            let result = sum_list(mylist)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(6)));
+    }
+
+    #[test]
+    fn compile_sum_type_nullary_constructor() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            type Option = Some(value: Int) | None
+            function unwrap_or(opt: Option, default: Int) {
+                match opt {
+                    Some(v) -> v
+                    None -> default
+                }
+            }
+            let result = unwrap_or(None(), 99)
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(99)));
     }
 }

@@ -264,6 +264,14 @@ fn format_value(val: &Value) -> String {
             let inner: Vec<String> = items.iter().map(format_value).collect();
             format!("[{}]", inner.join(", "))
         }
+        Value::Constructor { name, fields } => {
+            if fields.is_empty() {
+                name.clone()
+            } else {
+                let inner: Vec<String> = fields.iter().map(format_value).collect();
+                format!("{name}({})", inner.join(", "))
+            }
+        }
         Value::Object(map) => {
             let fields: Vec<String> = map
                 .iter()

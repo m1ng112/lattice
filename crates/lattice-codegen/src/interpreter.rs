@@ -629,6 +629,7 @@ impl Interpreter {
                 Instruction::TestConstructor(name) => {
                     let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
                     let matches = match val {
+                        Value::Constructor { name: n, .. } => n == name,
                         Value::Object(map) => map.get("__constructor").map_or(false, |v| {
                             matches!(v, Value::String(n) if n == name)
                         }),
@@ -639,6 +640,9 @@ impl Interpreter {
                 Instruction::ExtractField(idx) => {
                     let val = self.pop()?;
                     match val {
+                        Value::Constructor { fields, .. } => {
+                            self.stack.push(fields.get(*idx).cloned().unwrap_or(Value::Null));
+                        }
                         Value::Object(map) => {
                             let field_val = map
                                 .get(&format!("__{idx}"))
@@ -685,6 +689,20 @@ impl Interpreter {
                         }
                         _ => return Err(CodegenError::TypeError("slice requires array".into())),
                     }
+                }
+
+                // ── Constructors ───────────────────
+                Instruction::MakeConstructor(name, count) => {
+                    let count = *count;
+                    let mut fields = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        fields.push(self.pop()?);
+                    }
+                    fields.reverse();
+                    self.stack.push(Value::Constructor {
+                        name: name.clone(),
+                        fields,
+                    });
                 }
 
                 // ── Closures ───────────────────────
@@ -1036,6 +1054,7 @@ impl Interpreter {
                 Instruction::TestConstructor(name) => {
                     let val = self.stack.last().ok_or(CodegenError::StackUnderflow)?;
                     let matches = match val {
+                        Value::Constructor { name: n, .. } => n == name,
                         Value::Object(map) => map.get("__constructor").map_or(false, |v| {
                             matches!(v, Value::String(n) if n == name)
                         }),
@@ -1046,6 +1065,9 @@ impl Interpreter {
                 Instruction::ExtractField(idx) => {
                     let val = self.pop()?;
                     match val {
+                        Value::Constructor { fields, .. } => {
+                            self.stack.push(fields.get(*idx).cloned().unwrap_or(Value::Null));
+                        }
                         Value::Object(map) => {
                             let field_val = map
                                 .get(&format!("__{idx}"))
@@ -1092,6 +1114,20 @@ impl Interpreter {
                         }
                         _ => return Err(CodegenError::TypeError("slice requires array".into())),
                     }
+                }
+
+                // ── Constructors ───────────────────
+                Instruction::MakeConstructor(name, count) => {
+                    let count = *count;
+                    let mut fields = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        fields.push(self.pop()?);
+                    }
+                    fields.reverse();
+                    self.stack.push(Value::Constructor {
+                        name: name.clone(),
+                        fields,
+                    });
                 }
 
                 // ── Closures ───────────────────────
@@ -1221,6 +1257,10 @@ fn values_eq(a: &Value, b: &Value) -> bool {
         (Value::Int(x), Value::Float(y)) => (*x as f64) == *y,
         (Value::Float(x), Value::Int(y)) => *x == (*y as f64),
         (Value::String(x), Value::String(y)) => x == y,
+        (
+            Value::Constructor { name: n1, fields: f1 },
+            Value::Constructor { name: n2, fields: f2 },
+        ) => n1 == n2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(a, b)| values_eq(a, b)),
         _ => false,
     }
 }
@@ -1848,5 +1888,122 @@ mod tests {
         let expr = binop(bool_lit(true), BinOp::Add, int(1));
         let result = eval_expr(&expr);
         assert!(matches!(result, Err(CodegenError::TypeError(_))));
+    }
+
+    #[test]
+    fn make_constructor_no_fields() {
+        let program = Program {
+            functions: vec![Function {
+                name: "__expr__".into(),
+                params: vec![],
+                instructions: vec![
+                    Instruction::MakeConstructor("None".into(), 0),
+                    Instruction::Return,
+                ],
+            }],
+            entry: 0,
+        };
+        let mut interp = Interpreter::new();
+        let result = interp.execute(&program).unwrap();
+        assert_eq!(
+            result,
+            Value::Constructor {
+                name: "None".into(),
+                fields: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn make_constructor_with_fields() {
+        let program = Program {
+            functions: vec![Function {
+                name: "__expr__".into(),
+                params: vec![],
+                instructions: vec![
+                    Instruction::PushInt(42),
+                    Instruction::MakeConstructor("Some".into(), 1),
+                    Instruction::Return,
+                ],
+            }],
+            entry: 0,
+        };
+        let mut interp = Interpreter::new();
+        let result = interp.execute(&program).unwrap();
+        assert_eq!(
+            result,
+            Value::Constructor {
+                name: "Some".into(),
+                fields: vec![Value::Int(42)],
+            }
+        );
+    }
+
+    #[test]
+    fn test_constructor_and_extract_field() {
+        let program = Program {
+            functions: vec![Function {
+                name: "__expr__".into(),
+                params: vec![],
+                instructions: vec![
+                    // Build Some(42)
+                    Instruction::PushInt(42),
+                    Instruction::MakeConstructor("Some".into(), 1),
+                    // Test it's a "Some"
+                    Instruction::Dup,
+                    Instruction::TestConstructor("Some".into()),
+                    Instruction::StoreVar("is_some".into()),
+                    // Extract field 0
+                    Instruction::ExtractField(0),
+                    Instruction::Return,
+                ],
+            }],
+            entry: 0,
+        };
+        let mut interp = Interpreter::new();
+        let result = interp.execute(&program).unwrap();
+        assert_eq!(result, Value::Int(42));
+    }
+
+    #[test]
+    fn constructor_equality() {
+        let program = Program {
+            functions: vec![Function {
+                name: "__expr__".into(),
+                params: vec![],
+                instructions: vec![
+                    Instruction::PushInt(1),
+                    Instruction::MakeConstructor("A".into(), 1),
+                    Instruction::PushInt(1),
+                    Instruction::MakeConstructor("A".into(), 1),
+                    Instruction::Eq,
+                    Instruction::Return,
+                ],
+            }],
+            entry: 0,
+        };
+        let mut interp = Interpreter::new();
+        assert_eq!(interp.execute(&program).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn constructor_inequality_different_name() {
+        let program = Program {
+            functions: vec![Function {
+                name: "__expr__".into(),
+                params: vec![],
+                instructions: vec![
+                    Instruction::PushInt(1),
+                    Instruction::MakeConstructor("A".into(), 1),
+                    Instruction::PushInt(1),
+                    Instruction::MakeConstructor("B".into(), 1),
+                    Instruction::Eq,
+                    Instruction::Return,
+                ],
+            }],
+            entry: 0,
+        };
+        let mut interp = Interpreter::new();
+        assert_eq!(interp.execute(&program).unwrap(), Value::Bool(false));
     }
 }

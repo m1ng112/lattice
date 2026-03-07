@@ -14,6 +14,11 @@ pub enum Value {
     Float(f64),
     String(String),
     Array(Vec<Value>),
+    /// A tagged constructor value for algebraic data types (e.g., `Some(42)`, `Cons(1, Nil)`).
+    Constructor {
+        name: String,
+        fields: Vec<Value>,
+    },
     Object(HashMap<String, Value>),
 }
 

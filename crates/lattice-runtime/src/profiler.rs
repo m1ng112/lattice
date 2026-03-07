@@ -131,6 +131,9 @@ fn estimate_value_size(value: &crate::node::Value) -> usize {
         Value::Float(_) => 8,
         Value::String(s) => s.len(),
         Value::Array(arr) => arr.iter().map(estimate_value_size).sum(),
+        Value::Constructor { name, fields } => {
+            name.len() + fields.iter().map(estimate_value_size).sum::<usize>()
+        }
         Value::Object(map) => map
             .iter()
             .map(|(k, v)| k.len() + estimate_value_size(v))

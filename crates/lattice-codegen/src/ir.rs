@@ -66,6 +66,8 @@ pub enum Instruction {
     GetField(String),
     MakeArray(usize),
     MakeRecord(Vec<String>),
+    /// Construct a tagged value: pops `n` values from the stack, creates `Value::Constructor { name, fields }`.
+    MakeConstructor(String, usize),
 
     // ── Pattern matching ─────────────────────
     /// Test if top of stack equals a literal int (pushes bool, doesn't pop).
