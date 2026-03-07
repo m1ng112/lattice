@@ -366,7 +366,7 @@ fn is_balanced(input: &str) -> bool {
 }
 
 /// Convert a parser AST expression to the type checker's AST expression.
-fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Expr> {
+pub fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Expr> {
     use lattice_types::ast as tc;
     let span = tc::Span::dummy();
     match expr {
@@ -525,7 +525,7 @@ fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Expr> 
     }
 }
 
-fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types::ast::Pattern> {
+pub fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types::ast::Pattern> {
     use lattice_types::ast::Pattern as TcP;
     match pattern {
         ast::Pattern::Wildcard => Some(TcP::Wildcard),
@@ -545,7 +545,7 @@ fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types::as
     }
 }
 
-fn convert_type_expr_for_types(type_expr: &ast::TypeExpr) -> lattice_types::types::Type {
+pub fn convert_type_expr_for_types(type_expr: &ast::TypeExpr) -> lattice_types::types::Type {
     match type_expr {
         ast::TypeExpr::Named(name) => match name.as_str() {
             "Int" => lattice_types::types::Type::Int,

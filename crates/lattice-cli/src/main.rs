@@ -219,11 +219,76 @@ fn cmd_check(file: &PathBuf, verbose: bool) -> Result<(), String> {
     let source = read_source(file)?;
     let program = parse_source(&source, file, verbose)?;
 
-    eprintln!(
-        "{} Parsed {} top-level item(s) — type checking not yet implemented.",
-        "warning:".yellow().bold(),
-        program.len(),
-    );
+    // Type check top-level items
+    let mut tc = lattice_types::checker::TypeChecker::new();
+    let mut type_errors = 0u32;
+    let mut type_checked = 0u32;
+
+    for item in &program {
+        match &item.node {
+            lattice_parser::ast::Item::LetBinding(lb) => {
+                if let Some(tc_expr) =
+                    lattice_repl::convert_expr_for_types(&lb.value.node)
+                {
+                    match tc.synthesize(&tc_expr) {
+                        Ok(ty) => {
+                            tc.env.bind(lb.name.clone(), ty.clone());
+                            type_checked += 1;
+                            if verbose {
+                                eprintln!(
+                                    "  {} let {}: {}",
+                                    "✓".green(),
+                                    lb.name,
+                                    ty
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            type_errors += 1;
+                            eprintln!("  {} {}", "✗".red().bold(), e);
+                        }
+                    }
+                }
+            }
+            lattice_parser::ast::Item::Function(f) => {
+                // Register function type in environment for mutual references
+                let param_types: Vec<lattice_types::types::Type> = f
+                    .params
+                    .iter()
+                    .map(|p| lattice_repl::convert_type_expr_for_types(&p.type_expr.node))
+                    .collect();
+                let ret_type = f
+                    .return_type
+                    .as_ref()
+                    .map(|t| lattice_repl::convert_type_expr_for_types(&t.node))
+                    .unwrap_or(lattice_types::types::Type::Unit);
+                tc.env.bind(
+                    f.name.clone(),
+                    lattice_types::types::Type::Function {
+                        params: param_types,
+                        return_type: Box::new(ret_type),
+                    },
+                );
+                type_checked += 1;
+                if verbose {
+                    eprintln!("  {} function {}", "✓".green(), f.name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if type_errors > 0 {
+        eprintln!(
+            "{} {type_checked} item(s) checked, {type_errors} type error(s)",
+            "check:".red().bold(),
+        );
+    } else {
+        eprintln!(
+            "{} {type_checked} item(s) type-checked OK",
+            "check:".green().bold(),
+        );
+    }
 
     // Run proof verification as part of check
     let obligations = lattice_proof::obligation::extract_obligations(&program);
