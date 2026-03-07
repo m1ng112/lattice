@@ -132,14 +132,10 @@ fn parse_source(
     }
 
     result.map_err(|errors| {
-        let mut msg = format!(
-            "{} {} error(s) in {}\n",
-            "error:".red().bold(),
-            errors.len(),
-            path.display()
-        );
+        let mut msg = String::new();
+        let filename = path.display().to_string();
         for e in &errors {
-            msg.push_str(&format!("  {} {}\n", "-->".red(), e));
+            msg.push_str(&e.render(source, Some(&filename)));
         }
         msg
     })

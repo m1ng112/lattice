@@ -119,8 +119,11 @@ impl Repl {
     }
 
     fn eval_input(&mut self, input: &str) -> ReplResult {
-        // Try as a program item (let binding, function, etc.)
-        if input.starts_with("let ") || input.starts_with("function ") {
+        // Try as a program item (let binding, function, type, etc.)
+        if input.starts_with("let ")
+            || input.starts_with("function ")
+            || input.starts_with("type ")
+        {
             let combined = format!("{}\n{}", self.context.source, input);
             match parser::parse(&combined) {
                 Ok(_program) => {
@@ -138,7 +141,9 @@ impl Repl {
                                         // For let bindings, show the bound name
                                         if let Some(item) = program.last() {
                                             if let ast::Item::LetBinding(lb) = &item.node {
-                                                if let Some(val) = self.interpreter.globals().get(&lb.name) {
+                                                if let Some(val) =
+                                                    self.interpreter.globals().get(&lb.name)
+                                                {
                                                     return ReplResult::Value(format_value(val));
                                                 }
                                             }
@@ -150,11 +155,19 @@ impl Repl {
                                 Err(e) => return ReplResult::Error(e.to_string()),
                             }
                         }
-                        Err(errors) => return ReplResult::Error(format_parse_errors(&errors)),
+                        Err(errors) => {
+                            return ReplResult::Error(format_parse_errors_with_source(
+                                &errors,
+                                Some(input),
+                            ))
+                        }
                     }
                 }
                 Err(errors) => {
-                    return ReplResult::Error(format_parse_errors(&errors));
+                    return ReplResult::Error(format_parse_errors_with_source(
+                        &errors,
+                        Some(&combined),
+                    ));
                 }
             }
         }
@@ -171,7 +184,9 @@ impl Repl {
                     Err(e) => ReplResult::Error(e.to_string()),
                 }
             }
-            Err(errors) => ReplResult::Error(format_parse_errors(&errors)),
+            Err(errors) => {
+                ReplResult::Error(format_parse_errors_with_source(&errors, Some(input)))
+            }
         }
     }
 
@@ -283,11 +298,22 @@ fn format_value(val: &Value) -> String {
 }
 
 fn format_parse_errors(errors: &[parser::ParseError]) -> String {
-    errors
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join("\n")
+    format_parse_errors_with_source(errors, None)
+}
+
+fn format_parse_errors_with_source(errors: &[parser::ParseError], source: Option<&str>) -> String {
+    match source {
+        Some(src) => errors
+            .iter()
+            .map(|e| e.render(src, None))
+            .collect::<Vec<_>>()
+            .join(""),
+        None => errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 fn help_text() -> String {

@@ -48,6 +48,18 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl ParseError {
+    /// Render this error as a caret-style diagnostic using the original source.
+    pub fn render(&self, source: &str, filename: Option<&str>) -> String {
+        let sm = crate::diagnostic::SourceMap::new(source);
+        let mut diag = crate::diagnostic::Diagnostic::error(&self.message, self.offset);
+        if let Some(f) = filename {
+            diag = diag.with_filename(f);
+        }
+        diag.render(&sm)
+    }
+}
+
 // ─── Token ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
