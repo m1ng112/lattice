@@ -288,7 +288,8 @@ fn extract_properties(node_def: &ast::NodeDef) -> NodeProperties {
 /// Infer the node type from its AST definition.
 ///
 /// Heuristic: nodes with only outputs are sources, nodes with only inputs
-/// are sinks, otherwise they are compute nodes.
+/// are sinks, otherwise they are compute nodes. If a semantic block with
+/// a formal expression is present, it becomes the node's implementation.
 fn infer_node_type(node_def: &ast::NodeDef) -> NodeType {
     let has_input = node_def
         .fields
@@ -299,14 +300,23 @@ fn infer_node_type(node_def: &ast::NodeDef) -> NodeType {
         .iter()
         .any(|f| matches!(f, ast::NodeField::Output(_)));
 
+    // Extract formal expression from semantic block, if any
+    let formal_expr = node_def.fields.iter().find_map(|f| {
+        if let ast::NodeField::Semantic(sem) = f {
+            sem.formal.clone()
+        } else {
+            None
+        }
+    });
+
+    let implementation = formal_expr.map(NodeImpl::Expression);
+
     match (has_input, has_output) {
         (false, true) => NodeType::Source { data: vec![] },
         (true, false) => NodeType::Sink {
             results: vec![],
         },
-        _ => NodeType::Compute {
-            implementation: None,
-        },
+        _ => NodeType::Compute { implementation },
     }
 }
 

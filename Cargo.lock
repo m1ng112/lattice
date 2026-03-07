@@ -1093,6 +1093,7 @@ dependencies = [
  "clap",
  "colored",
  "lattice-bsg",
+ "lattice-codegen",
  "lattice-parser",
  "lattice-proof",
  "lattice-repl",
@@ -1108,12 +1109,14 @@ dependencies = [
 name = "lattice-codegen"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "lattice-parser",
  "lattice-runtime",
  "petgraph",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

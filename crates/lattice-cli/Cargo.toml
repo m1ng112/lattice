@@ -10,6 +10,7 @@ lattice-parser = { path = "../lattice-parser" }
 lattice-types = { path = "../lattice-types" }
 lattice-bsg = { path = "../lattice-bsg" }
 lattice-proof = { path = "../lattice-proof" }
+lattice-codegen = { path = "../lattice-codegen" }
 lattice-runtime = { path = "../lattice-runtime" }
 lattice-synthesizer = { path = "../lattice-synthesizer" }
 lattice-repl = { path = "../lattice-repl" }

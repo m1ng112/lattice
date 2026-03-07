@@ -11,3 +11,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 petgraph = "0.7"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -1032,6 +1032,41 @@ async fn cmd_run(
         scheduler = scheduler.with_timeout(ms);
     }
 
+    // Compile semantic block expressions into node executors
+    {
+        use lattice_codegen::executor::CompiledNodeExecutor;
+        use lattice_runtime::graph::NodeType;
+
+        for (name, &node_idx) in &exec_graph.node_indices {
+            let node = &exec_graph.graph[node_idx];
+            if let NodeType::Compute {
+                implementation: Some(lattice_runtime::graph::NodeImpl::Expression(expr)),
+            } = &node.node_type
+            {
+                match CompiledNodeExecutor::from_expr(name.clone(), &expr.node) {
+                    Ok(executor) => {
+                        if verbose {
+                            eprintln!(
+                                "{} Compiled expression for node '{}'",
+                                "info:".green(),
+                                name,
+                            );
+                        }
+                        scheduler.register_executor(name.clone(), std::sync::Arc::new(executor));
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "{} Failed to compile expression for node '{}': {}\n",
+                            "error:".red().bold(),
+                            name,
+                            e,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Execute the graph
     let result = scheduler
         .execute(&exec_graph, inputs)

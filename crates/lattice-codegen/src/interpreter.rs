@@ -151,6 +151,11 @@ impl Interpreter {
         self.run_function_persistent(entry, program)
     }
 
+    /// Set a variable in the interpreter's local scope before execution.
+    pub fn set_variable(&mut self, name: impl Into<String>, value: Value) {
+        self.variables.insert(name.into(), value);
+    }
+
     /// Returns a reference to the persistent global variables.
     pub fn globals(&self) -> &HashMap<String, Value> {
         &self.globals
