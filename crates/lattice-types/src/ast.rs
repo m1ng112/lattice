@@ -151,6 +151,44 @@ pub enum Expr {
         else_branch: Box<Expr>,
         span: Span,
     },
+    /// Array literal: `[expr1, expr2, ...]`
+    Array {
+        elements: Vec<Expr>,
+        span: Span,
+    },
+    /// Index access: `expr[index]`
+    Index {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+        span: Span,
+    },
+    /// Match expression: `match expr { pat -> body, ... }`
+    Match {
+        expr: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
+    /// Block expression: sequence of expressions, last is the value.
+    Block {
+        exprs: Vec<Expr>,
+        span: Span,
+    },
+}
+
+/// A match arm in the type checker AST.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    pub body: Expr,
+}
+
+/// Pattern in the type checker AST.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Wildcard,
+    Ident(String),
+    Literal(Expr),
+    Constructor(String, Vec<Pattern>),
 }
 
 impl Expr {
@@ -170,7 +208,11 @@ impl Expr {
             | Expr::Record { span, .. }
             | Expr::FieldAccess { span, .. }
             | Expr::WithUnit { span, .. }
-            | Expr::If { span, .. } => *span,
+            | Expr::If { span, .. }
+            | Expr::Array { span, .. }
+            | Expr::Index { span, .. }
+            | Expr::Match { span, .. }
+            | Expr::Block { span, .. } => *span,
         }
     }
 }

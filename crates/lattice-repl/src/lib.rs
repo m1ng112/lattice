@@ -418,7 +418,144 @@ fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Expr> 
                 span,
             })
         }
+        ast::Expr::Array(elements) => {
+            let elems: Option<Vec<_>> = elements
+                .iter()
+                .map(|e| convert_expr_for_types(&e.node))
+                .collect();
+            Some(tc::Expr::Array {
+                elements: elems?,
+                span,
+            })
+        }
+        ast::Expr::Index { expr, index } => {
+            let e = convert_expr_for_types(&expr.node)?;
+            let i = convert_expr_for_types(&index.node)?;
+            Some(tc::Expr::Index {
+                expr: Box::new(e),
+                index: Box::new(i),
+                span,
+            })
+        }
+        ast::Expr::Match { expr, arms } => {
+            let scrutinee = convert_expr_for_types(&expr.node)?;
+            let tc_arms: Option<Vec<_>> = arms
+                .iter()
+                .map(|arm| {
+                    let pattern = convert_pattern_for_types(&arm.pattern.node)?;
+                    let body = convert_expr_for_types(&arm.body.node)?;
+                    Some(tc::MatchArm { pattern, body })
+                })
+                .collect();
+            Some(tc::Expr::Match {
+                expr: Box::new(scrutinee),
+                arms: tc_arms?,
+                span,
+            })
+        }
+        ast::Expr::Block(exprs) => {
+            let tc_exprs: Option<Vec<_>> = exprs
+                .iter()
+                .map(|e| convert_expr_for_types(&e.node))
+                .collect();
+            Some(tc::Expr::Block {
+                exprs: tc_exprs?,
+                span,
+            })
+        }
+        ast::Expr::Lambda { params, body } => {
+            let tc_params: Vec<(String, lattice_types::types::Type)> = params
+                .iter()
+                .map(|p| {
+                    let ty = convert_type_expr_for_types(&p.type_expr.node);
+                    (p.name.clone(), ty)
+                })
+                .collect();
+            let tc_body = convert_expr_for_types(&body.node)?;
+            Some(tc::Expr::Lambda {
+                params: tc_params,
+                body: Box::new(tc_body),
+                span,
+            })
+        }
+        ast::Expr::Pipeline { left, right } => {
+            let l = convert_expr_for_types(&left.node)?;
+            let r = convert_expr_for_types(&right.node)?;
+            Some(tc::Expr::BinOp {
+                op: tc::BinOp::Pipe,
+                lhs: Box::new(l),
+                rhs: Box::new(r),
+                span,
+            })
+        }
+        ast::Expr::Call { func, args } => {
+            let f = convert_expr_for_types(&func.node)?;
+            let tc_args: Option<Vec<_>> = args
+                .iter()
+                .map(|a| convert_expr_for_types(&a.node))
+                .collect();
+            Some(tc::Expr::Apply {
+                func: Box::new(f),
+                args: tc_args?,
+                span,
+            })
+        }
+        ast::Expr::Record(fields) => {
+            let tc_fields: Option<Vec<_>> = fields
+                .iter()
+                .map(|(name, val)| {
+                    let v = convert_expr_for_types(&val.node)?;
+                    Some((name.clone(), v))
+                })
+                .collect();
+            Some(tc::Expr::Record {
+                fields: tc_fields?,
+                span,
+            })
+        }
+        ast::Expr::Field { expr, name } => {
+            let e = convert_expr_for_types(&expr.node)?;
+            Some(tc::Expr::FieldAccess {
+                expr: Box::new(e),
+                field: name.clone(),
+                span,
+            })
+        }
         _ => None,
+    }
+}
+
+fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types::ast::Pattern> {
+    use lattice_types::ast::Pattern as TcP;
+    match pattern {
+        ast::Pattern::Wildcard => Some(TcP::Wildcard),
+        ast::Pattern::Ident(name) => Some(TcP::Ident(name.clone())),
+        ast::Pattern::Literal(lit) => {
+            let expr = convert_expr_for_types(&lit.node)?;
+            Some(TcP::Literal(expr))
+        }
+        ast::Pattern::Constructor(name, sub_pats) => {
+            let tc_pats: Option<Vec<_>> = sub_pats
+                .iter()
+                .map(|p| convert_pattern_for_types(&p.node))
+                .collect();
+            Some(TcP::Constructor(name.clone(), tc_pats?))
+        }
+        ast::Pattern::Record(_) => None,
+    }
+}
+
+fn convert_type_expr_for_types(type_expr: &ast::TypeExpr) -> lattice_types::types::Type {
+    match type_expr {
+        ast::TypeExpr::Named(name) => match name.as_str() {
+            "Int" => lattice_types::types::Type::Int,
+            "Float" => lattice_types::types::Type::Float,
+            "String" => lattice_types::types::Type::String,
+            "Bool" => lattice_types::types::Type::Bool,
+            "Unit" => lattice_types::types::Type::Unit,
+            _ => lattice_types::types::Type::Named(name.clone()),
+        },
+        _ => lattice_types::types::Type::Named("Unknown".into()),
     }
 }
 
@@ -548,5 +685,19 @@ mod tests {
     fn format_value_array() {
         let val = Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]);
         assert_eq!(format_value(&val), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn type_command_array() {
+        let mut repl = Repl::new();
+        let result = repl.eval_line(":type [1, 2, 3]");
+        assert!(matches!(result, ReplResult::TypeInfo(ref s) if s.contains("[Int]")));
+    }
+
+    #[test]
+    fn type_command_lambda() {
+        let mut repl = Repl::new();
+        let result = repl.eval_line(":type fn(x: Int) -> x + 1");
+        assert!(matches!(result, ReplResult::TypeInfo(ref s) if s.contains("Int") && s.contains("->")));
     }
 }

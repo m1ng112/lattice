@@ -65,6 +65,9 @@ pub enum Type {
         args: Vec<Type>,
     },
 
+    /// Array type: `[T]`
+    Array(Box<Type>),
+
     /// Stream type: `Stream<T>`
     Stream(Box<Type>),
 
@@ -162,6 +165,7 @@ impl fmt::Display for Type {
                 let as_: Vec<_> = args.iter().map(|a| a.to_string()).collect();
                 write!(f, "{constructor}<{}>", as_.join(", "))
             }
+            Type::Array(inner) => write!(f, "[{inner}]"),
             Type::Stream(inner) => write!(f, "Stream<{inner}>"),
             Type::Distribution(inner) => write!(f, "Distribution<{inner}>"),
             Type::WithUnit { base, unit } => write!(f, "{base}.{unit}"),
