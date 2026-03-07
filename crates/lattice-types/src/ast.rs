@@ -47,8 +47,27 @@ pub enum BinOp {
     // Logical
     And,
     Or,
+    Implies,
+    // String
+    Concat,
     // Pipeline
     Pipe,
+}
+
+/// Unary operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    Neg,
+    Not,
+}
+
+/// A statement inside a do-block.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DoStatement {
+    Bind { name: String, expr: Expr },
+    Let { name: String, expr: Expr },
+    Expr(Expr),
+    Yield(Expr),
 }
 
 impl BinOp {
@@ -64,7 +83,7 @@ impl BinOp {
 
     /// Returns true if this is a logical operator.
     pub fn is_logical(self) -> bool {
-        matches!(self, BinOp::And | BinOp::Or)
+        matches!(self, BinOp::And | BinOp::Or | BinOp::Implies)
     }
 }
 
@@ -173,6 +192,36 @@ pub enum Expr {
         exprs: Vec<Expr>,
         span: Span,
     },
+    /// Unary operation: `-x`, `not x`
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
+    /// Type ascription: `expr : Type`
+    Ascription {
+        expr: Box<Expr>,
+        ty: Type,
+        span: Span,
+    },
+    /// Do-block (monadic sequencing): `do { stmts... }`
+    DoBlock {
+        stmts: Vec<DoStatement>,
+        span: Span,
+    },
+    /// Range expression: `start..end`
+    Range {
+        start: Box<Expr>,
+        end: Box<Expr>,
+        span: Span,
+    },
+    /// Slice: `expr[start:end]`
+    Slice {
+        expr: Box<Expr>,
+        start: Option<Box<Expr>>,
+        end: Option<Box<Expr>>,
+        span: Span,
+    },
 }
 
 /// A match arm in the type checker AST.
@@ -212,7 +261,12 @@ impl Expr {
             | Expr::Array { span, .. }
             | Expr::Index { span, .. }
             | Expr::Match { span, .. }
-            | Expr::Block { span, .. } => *span,
+            | Expr::Block { span, .. }
+            | Expr::UnaryOp { span, .. }
+            | Expr::Ascription { span, .. }
+            | Expr::DoBlock { span, .. }
+            | Expr::Range { span, .. }
+            | Expr::Slice { span, .. } => *span,
         }
     }
 }

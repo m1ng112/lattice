@@ -398,6 +398,124 @@ impl TypeChecker {
                 }
                 Ok(last_ty)
             }
+
+            Expr::UnaryOp { op, operand, span } => {
+                let operand_ty = self.synthesize(operand)?;
+                match op {
+                    crate::ast::UnaryOp::Neg => {
+                        if matches!(operand_ty, Type::Int | Type::Float) {
+                            Ok(operand_ty)
+                        } else {
+                            let err = TypeError::Mismatch {
+                                expected: Type::Int,
+                                found: operand_ty,
+                                span: *span,
+                            };
+                            self.errors.push(err.clone());
+                            Err(err)
+                        }
+                    }
+                    crate::ast::UnaryOp::Not => {
+                        if operand_ty == Type::Bool {
+                            Ok(Type::Bool)
+                        } else {
+                            let err = TypeError::Mismatch {
+                                expected: Type::Bool,
+                                found: operand_ty,
+                                span: *span,
+                            };
+                            self.errors.push(err.clone());
+                            Err(err)
+                        }
+                    }
+                }
+            }
+
+            Expr::Ascription { expr, ty, span } => {
+                self.check(expr, ty).map_err(|_| {
+                    let actual = self.synthesize(expr).unwrap_or(Type::Unit);
+                    let err = TypeError::Mismatch {
+                        expected: ty.clone(),
+                        found: actual,
+                        span: *span,
+                    };
+                    self.errors.push(err.clone());
+                    err
+                })?;
+                Ok(ty.clone())
+            }
+
+            Expr::DoBlock { stmts, span: _ } => {
+                self.env.push_scope();
+                let mut last_ty = Type::Unit;
+                for stmt in stmts {
+                    match stmt {
+                        crate::ast::DoStatement::Let { name, expr } => {
+                            let ty = self.synthesize(expr)?;
+                            self.env.bind(name.clone(), ty);
+                            last_ty = Type::Unit;
+                        }
+                        crate::ast::DoStatement::Bind { name, expr } => {
+                            let ty = self.synthesize(expr)?;
+                            self.env.bind(name.clone(), ty);
+                            last_ty = Type::Unit;
+                        }
+                        crate::ast::DoStatement::Expr(expr) => {
+                            last_ty = self.synthesize(expr)?;
+                        }
+                        crate::ast::DoStatement::Yield(expr) => {
+                            last_ty = self.synthesize(expr)?;
+                        }
+                    }
+                }
+                self.env.pop_scope();
+                Ok(last_ty)
+            }
+
+            Expr::Range { start, end, span } => {
+                let start_ty = self.synthesize(start)?;
+                let end_ty = self.synthesize(end)?;
+                if start_ty != Type::Int {
+                    let err = TypeError::Mismatch {
+                        expected: Type::Int,
+                        found: start_ty,
+                        span: *span,
+                    };
+                    self.errors.push(err.clone());
+                    return Err(err);
+                }
+                if end_ty != Type::Int {
+                    let err = TypeError::Mismatch {
+                        expected: Type::Int,
+                        found: end_ty,
+                        span: *span,
+                    };
+                    self.errors.push(err.clone());
+                    return Err(err);
+                }
+                Ok(Type::Array(Box::new(Type::Int)))
+            }
+
+            Expr::Slice {
+                expr: arr_expr,
+                start: _,
+                end: _,
+                span,
+            } => {
+                let arr_ty = self.synthesize(arr_expr)?;
+                match arr_ty {
+                    Type::Array(elem) => Ok(Type::Array(elem)),
+                    _ => {
+                        let err = TypeError::Mismatch {
+                            expected: Type::Array(Box::new(Type::Unit)),
+                            found: arr_ty,
+                            span: *span,
+                        };
+                        self.errors.push(err.clone());
+                        Err(err)
+                    }
+                }
+            }
         }
     }
 
@@ -716,6 +834,28 @@ impl TypeChecker {
                 return Err(err);
             }
             return Ok(Type::Bool);
+        }
+
+        if op == BinOp::Concat {
+            if lhs_type != Type::String {
+                let err = TypeError::Mismatch {
+                    expected: Type::String,
+                    found: lhs_type,
+                    span: lhs.span(),
+                };
+                self.errors.push(err.clone());
+                return Err(err);
+            }
+            if rhs_type != Type::String {
+                let err = TypeError::Mismatch {
+                    expected: Type::String,
+                    found: rhs_type,
+                    span: rhs.span(),
+                };
+                self.errors.push(err.clone());
+                return Err(err);
+            }
+            return Ok(Type::String);
         }
 
         unreachable!("all BinOp variants covered")
@@ -1466,5 +1606,209 @@ mod tests {
             span: s(),
         };
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Unit);
+    }
+
+    // ── UnaryOp tests ───────────────────────────────────────────
+
+    #[test]
+    fn synthesize_neg_int() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Neg,
+            operand: Box::new(Expr::IntLit { value: 5, span: s() }),
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+    }
+
+    #[test]
+    fn synthesize_neg_float() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Neg,
+            operand: Box::new(Expr::FloatLit { value: 3.14, span: s() }),
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Float);
+    }
+
+    #[test]
+    fn synthesize_neg_bool_error() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Neg,
+            operand: Box::new(Expr::BoolLit { value: true, span: s() }),
+            span: s(),
+        };
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    #[test]
+    fn synthesize_not_bool() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Not,
+            operand: Box::new(Expr::BoolLit { value: true, span: s() }),
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn synthesize_not_int_error() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::UnaryOp {
+            op: crate::ast::UnaryOp::Not,
+            operand: Box::new(Expr::IntLit { value: 1, span: s() }),
+            span: s(),
+        };
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── Concat tests ────────────────────────────────────────────
+
+    #[test]
+    fn synthesize_concat() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::BinOp {
+            op: BinOp::Concat,
+            lhs: Box::new(Expr::StringLit { value: "hello".into(), span: s() }),
+            rhs: Box::new(Expr::StringLit { value: " world".into(), span: s() }),
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::String);
+    }
+
+    #[test]
+    fn synthesize_concat_int_error() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::BinOp {
+            op: BinOp::Concat,
+            lhs: Box::new(Expr::IntLit { value: 1, span: s() }),
+            rhs: Box::new(Expr::StringLit { value: "x".into(), span: s() }),
+            span: s(),
+        };
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── Implies tests ───────────────────────────────────────────
+
+    #[test]
+    fn synthesize_implies() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::BinOp {
+            op: BinOp::Implies,
+            lhs: Box::new(Expr::BoolLit { value: true, span: s() }),
+            rhs: Box::new(Expr::BoolLit { value: false, span: s() }),
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
+    }
+
+    // ── Ascription tests ────────────────────────────────────────
+
+    #[test]
+    fn synthesize_ascription() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Ascription {
+            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
+            ty: Type::Int,
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+    }
+
+    #[test]
+    fn synthesize_ascription_mismatch() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Ascription {
+            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
+            ty: Type::String,
+            span: s(),
+        };
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── DoBlock tests ───────────────────────────────────────────
+
+    #[test]
+    fn synthesize_do_block() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::DoBlock {
+            stmts: vec![
+                crate::ast::DoStatement::Let {
+                    name: "x".into(),
+                    expr: Expr::IntLit { value: 10, span: s() },
+                },
+                crate::ast::DoStatement::Yield(Expr::Var {
+                    name: "x".into(),
+                    span: s(),
+                }),
+            ],
+            span: s(),
+        };
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+    }
+
+    // ── Range tests ─────────────────────────────────────────────
+
+    #[test]
+    fn synthesize_range() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Range {
+            start: Box::new(Expr::IntLit { value: 0, span: s() }),
+            end: Box::new(Expr::IntLit { value: 10, span: s() }),
+            span: s(),
+        };
+        assert_eq!(
+            tc.synthesize(&expr).unwrap(),
+            Type::Array(Box::new(Type::Int))
+        );
+    }
+
+    #[test]
+    fn synthesize_range_float_error() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Range {
+            start: Box::new(Expr::FloatLit { value: 0.0, span: s() }),
+            end: Box::new(Expr::IntLit { value: 10, span: s() }),
+            span: s(),
+        };
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── Slice tests ─────────────────────────────────────────────
+
+    #[test]
+    fn synthesize_slice() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Slice {
+            expr: Box::new(Expr::Array {
+                elements: vec![
+                    Expr::IntLit { value: 1, span: s() },
+                    Expr::IntLit { value: 2, span: s() },
+                ],
+                span: s(),
+            }),
+            start: Some(Box::new(Expr::IntLit { value: 0, span: s() })),
+            end: Some(Box::new(Expr::IntLit { value: 1, span: s() })),
+            span: s(),
+        };
+        assert_eq!(
+            tc.synthesize(&expr).unwrap(),
+            Type::Array(Box::new(Type::Int))
+        );
+    }
+
+    #[test]
+    fn synthesize_slice_non_array_error() {
+        let mut tc = TypeChecker::new();
+        let expr = Expr::Slice {
+            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
+            start: None,
+            end: None,
+            span: s(),
+        };
+        assert!(tc.synthesize(&expr).is_err());
     }
 }

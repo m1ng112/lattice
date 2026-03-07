@@ -396,6 +396,8 @@ pub fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Ex
                 ast::BinOp::Geq => tc::BinOp::Ge,
                 ast::BinOp::And => tc::BinOp::And,
                 ast::BinOp::Or => tc::BinOp::Or,
+                ast::BinOp::Concat => tc::BinOp::Concat,
+                ast::BinOp::Implies => tc::BinOp::Implies,
                 _ => return None,
             };
             let lhs = convert_expr_for_types(&left.node)?;
@@ -518,6 +520,98 @@ pub fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Ex
             Some(tc::Expr::FieldAccess {
                 expr: Box::new(e),
                 field: name.clone(),
+                span,
+            })
+        }
+        ast::Expr::UnaryOp { op, operand } => {
+            let tc_op = match op {
+                ast::UnaryOp::Neg => tc::UnaryOp::Neg,
+                ast::UnaryOp::Not => tc::UnaryOp::Not,
+            };
+            let e = convert_expr_for_types(&operand.node)?;
+            Some(tc::Expr::UnaryOp {
+                op: tc_op,
+                operand: Box::new(e),
+                span,
+            })
+        }
+        ast::Expr::Ascription { expr, type_expr } => {
+            let e = convert_expr_for_types(&expr.node)?;
+            let ty = convert_type_expr_for_types(&type_expr.node);
+            Some(tc::Expr::Ascription {
+                expr: Box::new(e),
+                ty,
+                span,
+            })
+        }
+        ast::Expr::DoBlock(stmts) => {
+            let tc_stmts: Option<Vec<_>> = stmts
+                .iter()
+                .map(|s| match &s.node {
+                    ast::DoStatement::Bind { name, expr } => {
+                        let e = convert_expr_for_types(&expr.node)?;
+                        Some(tc::DoStatement::Bind {
+                            name: name.clone(),
+                            expr: e,
+                        })
+                    }
+                    ast::DoStatement::Let { name, expr } => {
+                        let e = convert_expr_for_types(&expr.node)?;
+                        Some(tc::DoStatement::Let {
+                            name: name.clone(),
+                            expr: e,
+                        })
+                    }
+                    ast::DoStatement::Expr(expr) => {
+                        let e = convert_expr_for_types(&expr.node)?;
+                        Some(tc::DoStatement::Expr(e))
+                    }
+                    ast::DoStatement::Yield(expr) => {
+                        let e = convert_expr_for_types(&expr.node)?;
+                        Some(tc::DoStatement::Yield(e))
+                    }
+                })
+                .collect();
+            Some(tc::Expr::DoBlock {
+                stmts: tc_stmts?,
+                span,
+            })
+        }
+        ast::Expr::Range { start, end } => {
+            let s = convert_expr_for_types(&start.node)?;
+            let e = convert_expr_for_types(&end.node)?;
+            Some(tc::Expr::Range {
+                start: Box::new(s),
+                end: Box::new(e),
+                span,
+            })
+        }
+        ast::Expr::Slice {
+            expr,
+            start,
+            end,
+        } => {
+            let e = convert_expr_for_types(&expr.node)?;
+            let s = start
+                .as_ref()
+                .and_then(|s| convert_expr_for_types(&s.node).map(Box::new));
+            let en = end
+                .as_ref()
+                .and_then(|e| convert_expr_for_types(&e.node).map(Box::new));
+            Some(tc::Expr::Slice {
+                expr: Box::new(e),
+                start: s,
+                end: en,
+                span,
+            })
+        }
+        ast::Expr::Let { name, value, .. } => {
+            let v = convert_expr_for_types(&value.node)?;
+            Some(tc::Expr::Let {
+                name: name.clone(),
+                annotation: None,
+                value: Box::new(v),
+                body: Box::new(tc::Expr::UnitLit { span }),
                 span,
             })
         }
@@ -699,5 +793,26 @@ mod tests {
         let mut repl = Repl::new();
         let result = repl.eval_line(":type fn(x: Int) -> x + 1");
         assert!(matches!(result, ReplResult::TypeInfo(ref s) if s.contains("Int") && s.contains("->")));
+    }
+
+    #[test]
+    fn type_command_concat() {
+        let mut repl = Repl::new();
+        let result = repl.eval_line(":type \"hello\" ++ \" world\"");
+        assert!(matches!(result, ReplResult::TypeInfo(ref s) if s.contains("String")));
+    }
+
+    #[test]
+    fn type_command_negation() {
+        let mut repl = Repl::new();
+        let result = repl.eval_line(":type -42");
+        assert!(matches!(result, ReplResult::TypeInfo(ref s) if s.contains("Int")));
+    }
+
+    #[test]
+    fn type_command_not() {
+        let mut repl = Repl::new();
+        let result = repl.eval_line(":type not true");
+        assert!(matches!(result, ReplResult::TypeInfo(ref s) if s.contains("Bool")));
     }
 }
