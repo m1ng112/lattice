@@ -13,5 +13,7 @@ tower-lsp = { version = "0.20", features = ["proposed"] }
 tokio = { version = "1", features = ["full"] }
 lattice-parser = { path = "../lattice-parser" }
 lattice-proof = { path = "../lattice-proof" }
+lattice-types = { path = "../lattice-types" }
+lattice-repl = { path = "../lattice-repl" }
 serde.workspace = true
 serde_json.workspace = true
