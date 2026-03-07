@@ -286,6 +286,10 @@ impl Compiler {
                 self.compile_lambda(params, body, instructions)?;
             }
 
+            ast::Expr::DoBlock(statements) => {
+                self.compile_do_block(statements, instructions)?;
+            }
+
             _ => {
                 return Err(CodegenError::Unsupported(format!("{expr:?}")));
             }
@@ -453,6 +457,50 @@ impl Compiler {
         }
     }
 
+    /// Compile a do-block into sequential instructions.
+    ///
+    /// Do-block statements:
+    /// - `Bind { name, expr }` (x <- expr): evaluate expr, store in name
+    /// - `Let { name, expr }`: evaluate expr, store in name
+    /// - `Expr(e)`: evaluate and discard
+    /// - `Yield(e)`: evaluate — this becomes the block's result value
+    ///
+    /// If no Yield is present, the block evaluates to null.
+    fn compile_do_block(
+        &mut self,
+        statements: &[Spanned<ast::DoStatement>],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), CodegenError> {
+        let mut has_yield = false;
+
+        for stmt in statements {
+            match &stmt.node {
+                ast::DoStatement::Bind { name, expr } => {
+                    self.compile_expr(&expr.node, instructions)?;
+                    instructions.push(Instruction::StoreVar(name.clone()));
+                }
+                ast::DoStatement::Let { name, expr } => {
+                    self.compile_expr(&expr.node, instructions)?;
+                    instructions.push(Instruction::StoreVar(name.clone()));
+                }
+                ast::DoStatement::Expr(expr) => {
+                    self.compile_expr(&expr.node, instructions)?;
+                    instructions.push(Instruction::Pop);
+                }
+                ast::DoStatement::Yield(expr) => {
+                    self.compile_expr(&expr.node, instructions)?;
+                    has_yield = true;
+                }
+            }
+        }
+
+        if !has_yield {
+            instructions.push(Instruction::PushNull);
+        }
+
+        Ok(())
+    }
+
     fn compile_lambda(
         &mut self,
         params: &[ast::Param],
@@ -600,8 +648,29 @@ fn collect_free_vars(
         ast::Expr::WithUnit { value, .. } => {
             collect_free_vars(&value.node, free, bound);
         }
+        ast::Expr::DoBlock(statements) => {
+            let mut inner_bound = bound.clone();
+            for stmt in statements {
+                match &stmt.node {
+                    ast::DoStatement::Bind { name, expr } => {
+                        collect_free_vars(&expr.node, free, &mut inner_bound);
+                        inner_bound.insert(name.clone());
+                    }
+                    ast::DoStatement::Let { name, expr } => {
+                        collect_free_vars(&expr.node, free, &mut inner_bound);
+                        inner_bound.insert(name.clone());
+                    }
+                    ast::DoStatement::Expr(expr) => {
+                        collect_free_vars(&expr.node, free, &mut inner_bound);
+                    }
+                    ast::DoStatement::Yield(expr) => {
+                        collect_free_vars(&expr.node, free, &mut inner_bound);
+                    }
+                }
+            }
+        }
         _ => {
-            // DoBlock, Select, Project, Join, GroupBy, ForAll, Exists, Branch, Synthesize
+            // Select, Project, Join, GroupBy, ForAll, Exists, Branch, Synthesize
             // These are less common; skip for now
         }
     }
@@ -945,5 +1014,92 @@ mod tests {
         interp.register_stdlib();
         interp.execute_persistent(&program).unwrap();
         assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(99)));
+    }
+
+    #[test]
+    fn compile_do_block_simple() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            function find_user(id: Int) { id * 10 }
+            function create_order(user: Int, items: Int) { user + items }
+            let result = do {
+              user <- find_user(1)
+              order <- create_order(user, 5)
+              yield order
+            }
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        // find_user(1) = 10, create_order(10, 5) = 15
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(15)));
+    }
+
+    #[test]
+    fn compile_do_block_with_let() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            let result = do {
+              let x = 10
+              let y = 20
+              yield x + y
+            }
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(30)));
+    }
+
+    #[test]
+    fn compile_do_block_no_yield() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            let result = do {
+              let x = 42
+            }
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        // No yield → null
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Null));
+    }
+
+    #[test]
+    fn compile_do_block_with_expr_statement() {
+        use crate::interpreter::Interpreter;
+        use lattice_runtime::node::Value;
+
+        let source = r#"
+            function side_effect(x: Int) { x }
+            let result = do {
+              let x = 5
+              side_effect(x)
+              yield x * 2
+            }
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        interp.execute_persistent(&program).unwrap();
+        assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(10)));
     }
 }
