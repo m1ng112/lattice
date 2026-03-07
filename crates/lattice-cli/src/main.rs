@@ -402,6 +402,9 @@ fn run_proof_checker(
     obligations: &[lattice_proof::obligation::ProofObligation],
 ) -> Vec<(lattice_proof::obligation::ProofObligation, lattice_proof::checker::ProofResult)> {
     let mut checker = lattice_proof::checker::ProofChecker::new();
+    // SMT backend first (higher priority — handles multi-variable predicates, quantifiers)
+    checker.add_backend(Box::new(lattice_proof::smt_backend::SmtBackend::new()));
+    // Arithmetic backend as fallback (no external dependency)
     checker.add_backend(Box::new(lattice_proof::arithmetic_backend::ArithmeticBackend));
     checker.check_all(obligations)
 }
