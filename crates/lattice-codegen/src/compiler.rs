@@ -339,9 +339,9 @@ impl Compiler {
             instructions.push(Instruction::Pop);
         }
 
-        // No arm matched — pop scrutinee, push null
+        // No arm matched — pop scrutinee, panic
         instructions.push(Instruction::Pop);
-        instructions.push(Instruction::PushNull);
+        instructions.push(Instruction::Panic("non-exhaustive match: no pattern matched".into()));
 
         let end = instructions.len();
         for jump in end_jumps {
@@ -1101,5 +1101,29 @@ mod tests {
         interp.register_stdlib();
         interp.execute_persistent(&program).unwrap();
         assert_eq!(interp.globals().get("result").cloned(), Some(Value::Int(10)));
+    }
+
+    #[test]
+    fn compile_match_non_exhaustive_panics() {
+        use crate::interpreter::Interpreter;
+
+        let source = r#"
+            let x = match 42 {
+                0 -> "zero"
+                1 -> "one"
+            }
+        "#;
+        let items = lattice_parser::parser::parse(source).expect("parse failed");
+        let mut compiler = Compiler::new();
+        let program = compiler.compile_program(&items).unwrap();
+        let mut interp = Interpreter::new();
+        interp.register_stdlib();
+        let result = interp.execute_persistent(&program);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("non-exhaustive match"),
+            "expected non-exhaustive match error, got: {err}"
+        );
     }
 }

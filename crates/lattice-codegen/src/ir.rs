@@ -94,6 +94,9 @@ pub enum Instruction {
     // ── Debugging ───────────────────────────
     Print,
 
+    /// Runtime panic with an error message (e.g., non-exhaustive match).
+    Panic(String),
+
     // ── No-op ───────────────────────────────
     Nop,
 }

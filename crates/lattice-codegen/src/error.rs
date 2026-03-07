@@ -10,4 +10,6 @@ pub enum CodegenError {
     DivisionByZero,
     #[error("Stack underflow")]
     StackUnderflow,
+    #[error("Runtime panic: {0}")]
+    RuntimePanic(String),
 }

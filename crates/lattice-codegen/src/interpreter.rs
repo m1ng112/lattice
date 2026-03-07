@@ -761,6 +761,10 @@ impl Interpreter {
                     }
                 }
 
+                Instruction::Panic(msg) => {
+                    return Err(CodegenError::RuntimePanic(msg.clone()));
+                }
+
                 // ── No-op ───────────────────────────
                 Instruction::Nop => {}
             }
@@ -1181,6 +1185,9 @@ impl Interpreter {
                     if let Some(val) = self.stack.last() {
                         eprintln!("[print] {val:?}");
                     }
+                }
+                Instruction::Panic(msg) => {
+                    return Err(CodegenError::RuntimePanic(msg.clone()));
                 }
                 Instruction::Nop => {}
             }
