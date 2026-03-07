@@ -64,6 +64,12 @@ pub enum TypeError {
         else_type: Type,
         span: Span,
     },
+
+    #[error("non-exhaustive match at {span}: missing {missing}")]
+    NonExhaustiveMatch {
+        missing: String,
+        span: Span,
+    },
 }
 
 /// The bidirectional type checker.
@@ -365,10 +371,15 @@ impl TypeChecker {
             }
 
             Expr::Match { expr, arms, span } => {
-                let _scrutinee_ty = self.synthesize(expr)?;
+                let scrutinee_ty = self.synthesize(expr)?;
+                let scrutinee_ty = self.apply_subst(&scrutinee_ty);
                 if arms.is_empty() {
                     return Ok(Type::Unit);
                 }
+
+                // Exhaustiveness check
+                self.check_exhaustiveness(arms, &scrutinee_ty, *span);
+
                 // Bind pattern variables and infer body types
                 let first_ty = self.synthesize_match_arm(&arms[0])?;
                 for arm in &arms[1..] {
@@ -517,6 +528,74 @@ impl TypeChecker {
                 }
             }
         }
+    }
+
+    /// Check whether a match expression is exhaustive.
+    ///
+    /// If a wildcard or identifier pattern is present, the match is trivially exhaustive.
+    /// For sum types, checks that every constructor variant is covered.
+    /// Non-exhaustiveness is reported as a warning (pushed to errors but doesn't fail synthesis).
+    fn check_exhaustiveness(
+        &mut self,
+        arms: &[crate::ast::MatchArm],
+        scrutinee_ty: &Type,
+        span: Span,
+    ) {
+        use crate::ast::Pattern;
+
+        // If any arm has a wildcard or ident pattern, match is exhaustive
+        let has_catch_all = arms.iter().any(|arm| {
+            matches!(arm.pattern, Pattern::Wildcard | Pattern::Ident(_))
+        });
+        if has_catch_all {
+            return;
+        }
+
+        // Resolve the scrutinee type to find sum type variants
+        let variants = match scrutinee_ty {
+            Type::Sum { variants } => Some(variants.clone()),
+            Type::Named(name) => {
+                self.env.lookup_type(name).and_then(|td| {
+                    if let Type::Sum { variants } = &td.body {
+                        Some(variants.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(variants) = variants {
+            // Collect constructor names matched by the arms
+            let matched_constructors: std::collections::HashSet<&str> = arms
+                .iter()
+                .filter_map(|arm| {
+                    if let Pattern::Constructor(name, _) = &arm.pattern {
+                        Some(name.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let missing: Vec<&str> = variants
+                .iter()
+                .filter(|v| !matched_constructors.contains(v.name.as_str()))
+                .map(|v| v.name.as_str())
+                .collect();
+
+            if !missing.is_empty() {
+                let err = TypeError::NonExhaustiveMatch {
+                    missing: missing.join(", "),
+                    span,
+                };
+                self.errors.push(err);
+            }
+        }
+
+        // For non-sum types (Int, String, etc.) without a wildcard,
+        // we can't statically verify exhaustiveness — skip for now.
     }
 
     /// Synthesize the type of a match arm body, binding pattern variables.
@@ -923,7 +1002,7 @@ impl Default for TypeChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::Span;
+    use crate::ast::{MatchArm, Pattern, Span};
     use crate::types::*;
 
     fn s() -> Span {
@@ -1810,5 +1889,124 @@ mod tests {
             span: s(),
         };
         assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── Exhaustiveness tests ────────────────────────────────────
+
+    #[test]
+    fn exhaustive_match_with_wildcard() {
+        let mut tc = TypeChecker::new();
+        // match on Option type with wildcard — exhaustive
+        tc.env.bind("x".into(), Type::Named("Option".into()));
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Wildcard,
+                    body: Expr::IntLit { value: 0, span: s() },
+                },
+            ],
+            span: s(),
+        };
+        let _ = tc.synthesize(&expr).unwrap();
+        // No NonExhaustiveMatch error should be present
+        assert!(!tc.errors.iter().any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. })));
+    }
+
+    #[test]
+    fn exhaustive_match_all_constructors() {
+        let mut tc = TypeChecker::new();
+        // match on Option with Some(_) and None — exhaustive
+        tc.env.bind("x".into(), Type::Named("Option".into()));
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor("Some".into(), vec![Pattern::Ident("v".into())]),
+                    body: Expr::IntLit { value: 1, span: s() },
+                },
+                MatchArm {
+                    pattern: Pattern::Constructor("None".into(), vec![]),
+                    body: Expr::IntLit { value: 0, span: s() },
+                },
+            ],
+            span: s(),
+        };
+        let _ = tc.synthesize(&expr).unwrap();
+        assert!(!tc.errors.iter().any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. })));
+    }
+
+    #[test]
+    fn non_exhaustive_match_missing_constructor() {
+        let mut tc = TypeChecker::new();
+        // match on Option with only Some(_) — missing None
+        tc.env.bind("x".into(), Type::Named("Option".into()));
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor("Some".into(), vec![Pattern::Ident("v".into())]),
+                    body: Expr::IntLit { value: 1, span: s() },
+                },
+            ],
+            span: s(),
+        };
+        // Synthesis still succeeds (non-exhaustiveness is a warning)
+        let _ = tc.synthesize(&expr).unwrap();
+        let has_non_exhaustive = tc.errors.iter().any(|e| {
+            if let TypeError::NonExhaustiveMatch { missing, .. } = e {
+                missing.contains("None")
+            } else {
+                false
+            }
+        });
+        assert!(has_non_exhaustive);
+    }
+
+    #[test]
+    fn non_exhaustive_match_result_missing_err() {
+        let mut tc = TypeChecker::new();
+        tc.env.bind("r".into(), Type::Named("Result".into()));
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Var { name: "r".into(), span: s() }),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor("Ok".into(), vec![Pattern::Ident("v".into())]),
+                    body: Expr::IntLit { value: 1, span: s() },
+                },
+            ],
+            span: s(),
+        };
+        let _ = tc.synthesize(&expr).unwrap();
+        let has_non_exhaustive = tc.errors.iter().any(|e| {
+            if let TypeError::NonExhaustiveMatch { missing, .. } = e {
+                missing.contains("Err")
+            } else {
+                false
+            }
+        });
+        assert!(has_non_exhaustive);
+    }
+
+    #[test]
+    fn exhaustive_match_with_ident_catch_all() {
+        let mut tc = TypeChecker::new();
+        tc.env.bind("x".into(), Type::Named("Option".into()));
+        let expr = Expr::Match {
+            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::Constructor("Some".into(), vec![Pattern::Ident("v".into())]),
+                    body: Expr::IntLit { value: 1, span: s() },
+                },
+                MatchArm {
+                    pattern: Pattern::Ident("other".into()),
+                    body: Expr::IntLit { value: 0, span: s() },
+                },
+            ],
+            span: s(),
+        };
+        let _ = tc.synthesize(&expr).unwrap();
+        assert!(!tc.errors.iter().any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. })));
     }
 }
