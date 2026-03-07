@@ -1086,6 +1086,98 @@ impl Default for TypeChecker {
     }
 }
 
+// ── Dependent type bridge ─────────────────────────────────────────
+
+use crate::dependent::{Term, Universe};
+use crate::dependent_checker::DependentChecker;
+
+impl TypeChecker {
+    /// Attempt dependent type verification for a dependent type expression.
+    ///
+    /// Converts `TypeExpr::Dependent { name, params }` (e.g. `Tensor(3, 224, 224)`)
+    /// into a dependent `Term` and verifies it using the dependent checker.
+    /// Returns `Ok(Type::Applied { ... })` if valid.
+    pub fn check_dependent_type(
+        &mut self,
+        name: &str,
+        params: &[(String, Spanned<ast::TypeExpr>)],
+        span: Span,
+    ) -> Result<Type, TypeError> {
+        let mut dc = DependentChecker::new();
+
+        // Register the type constructor as living in Type₀
+        let constructor_type = build_constructor_type(name, params);
+        dc.define(
+            name.to_string(),
+            constructor_type.clone(),
+            Term::Universe(Universe::base()),
+        );
+
+        // Build the applied term: Name(arg1, arg2, ...)
+        let mut applied = Term::Var(name.to_string());
+        for (param_name, param_te) in params {
+            let arg = type_expr_to_term(&param_te.node, param_name);
+            applied = Term::App {
+                func: Box::new(applied),
+                arg: Box::new(arg),
+            };
+        }
+
+        // Attempt to infer the type of the applied term
+        match dc.infer(&applied) {
+            Ok(_inferred) => {
+                // Valid dependent type application
+                let args = params
+                    .iter()
+                    .map(|(_, te)| convert_type_expr(&te.node))
+                    .collect();
+                Ok(Type::Applied {
+                    constructor: name.to_string(),
+                    args,
+                })
+            }
+            Err(e) => {
+                let err = TypeError::Mismatch {
+                    expected: Type::Named(name.to_string()),
+                    found: Type::Named(format!("dependent type error: {e}")),
+                    span,
+                };
+                self.errors.push(err.clone());
+                Err(err)
+            }
+        }
+    }
+}
+
+/// Build a Pi-type for a dependent type constructor.
+/// E.g., `Tensor(n: Nat, m: Nat)` → `Π(n: Nat). Π(m: Nat). Type₀`
+fn build_constructor_type(
+    _name: &str,
+    params: &[(String, Spanned<ast::TypeExpr>)],
+) -> Term {
+    let mut result = Term::Universe(Universe::base());
+    for (param_name, param_te) in params.iter().rev() {
+        let param_type = type_expr_to_term(&param_te.node, param_name);
+        result = Term::Pi {
+            param: param_name.clone(),
+            param_type: Box::new(param_type),
+            body: Box::new(result),
+        };
+    }
+    result
+}
+
+/// Convert a parser TypeExpr to a dependent Term.
+fn type_expr_to_term(te: &ast::TypeExpr, _hint_name: &str) -> Term {
+    match te {
+        ast::TypeExpr::Named(name) => match name.as_str() {
+            "Int" | "Nat" => Term::Universe(Universe::base()),
+            _ => Term::Var(name.clone()),
+        },
+        _ => Term::Universe(Universe::base()),
+    }
+}
+
 // ── Free functions ────────────────────────────────────────────────
 
 fn is_arithmetic(op: ast::BinOp) -> bool {
@@ -1140,7 +1232,40 @@ pub fn convert_type_expr(type_expr: &ast::TypeExpr) -> Type {
         ast::TypeExpr::Distribution(inner) => {
             Type::Distribution(Box::new(convert_type_expr(&inner.node)))
         }
-        _ => Type::Named("Unknown".into()),
+        ast::TypeExpr::Dependent { name, params } => {
+            // Dependent type application: Tensor(n: Nat, m: Nat)
+            Type::Applied {
+                constructor: name.clone(),
+                args: params
+                    .iter()
+                    .map(|(_, t)| convert_type_expr(&t.node))
+                    .collect(),
+            }
+        }
+        ast::TypeExpr::Sum(variants) => Type::Sum {
+            variants: variants
+                .iter()
+                .map(|v| crate::types::Variant {
+                    name: v.name.clone(),
+                    fields: if v.fields.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            v.fields
+                                .iter()
+                                .map(|(n, t)| (n.clone(), convert_type_expr(&t.node)))
+                                .collect(),
+                        )
+                    },
+                })
+                .collect(),
+        },
+        ast::TypeExpr::Refinement { var, base, .. } => Type::Refinement {
+            var: var.clone(),
+            base: Box::new(convert_type_expr(&base.node)),
+            predicate: crate::types::Predicate::Bool(true), // simplified
+        },
+        ast::TypeExpr::Where { base, .. } => convert_type_expr(&base.node),
     }
 }
 
@@ -2074,5 +2199,79 @@ mod tests {
             .iter()
             .any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. }));
         assert!(non_exhaustive);
+    }
+
+    // ── Dependent type bridge tests ───────────────────────────────
+
+    #[test]
+    fn dependent_type_check_tensor() {
+        let mut tc = TypeChecker::new();
+        let result = tc.check_dependent_type(
+            "Tensor",
+            &[
+                (
+                    "n".into(),
+                    Spanned::dummy(ast::TypeExpr::Named("Nat".into())),
+                ),
+                (
+                    "m".into(),
+                    Spanned::dummy(ast::TypeExpr::Named("Nat".into())),
+                ),
+            ],
+            Span::dummy(),
+        );
+        assert!(result.is_ok());
+        let ty = result.unwrap();
+        assert!(matches!(ty, Type::Applied { constructor, .. } if constructor == "Tensor"));
+    }
+
+    #[test]
+    fn convert_dependent_type_expr() {
+        let te = ast::TypeExpr::Dependent {
+            name: "Vector".into(),
+            params: vec![("n".into(), Spanned::dummy(ast::TypeExpr::Named("Nat".into())))],
+        };
+        let ty = convert_type_expr(&te);
+        assert!(matches!(ty, Type::Applied { constructor, args } if constructor == "Vector" && args.len() == 1));
+    }
+
+    #[test]
+    fn convert_sum_type_expr() {
+        let te = ast::TypeExpr::Sum(vec![
+            ast::Variant {
+                name: "Some".into(),
+                fields: vec![("value".into(), Spanned::dummy(ast::TypeExpr::Named("Int".into())))],
+            },
+            ast::Variant {
+                name: "None".into(),
+                fields: vec![],
+            },
+        ]);
+        let ty = convert_type_expr(&te);
+        if let Type::Sum { variants } = ty {
+            assert_eq!(variants.len(), 2);
+            assert_eq!(variants[0].name, "Some");
+            assert!(variants[0].fields.is_some());
+            assert_eq!(variants[1].name, "None");
+            assert!(variants[1].fields.is_none());
+        } else {
+            panic!("expected Sum type");
+        }
+    }
+
+    #[test]
+    fn convert_function_type_expr() {
+        let te = ast::TypeExpr::Function {
+            params: vec![Spanned::dummy(ast::TypeExpr::Named("Int".into()))],
+            ret: Box::new(Spanned::dummy(ast::TypeExpr::Named("Bool".into()))),
+        };
+        let ty = convert_type_expr(&te);
+        assert_eq!(
+            ty,
+            Type::Function {
+                params: vec![Type::Int],
+                return_type: Box::new(Type::Bool),
+            }
+        );
     }
 }
