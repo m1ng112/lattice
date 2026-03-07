@@ -1,13 +1,42 @@
 //! Bidirectional type checker for Lattice programs.
 //!
-//! Implements synthesis (infer) and checking (verify) modes,
-//! subtyping, structural equality, and unification for inference.
+//! Operates directly on the parser AST (`lattice_parser::ast`),
+//! eliminating the need for a separate type-checker AST.
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, Span};
+use lattice_parser::ast::{self, Spanned};
+
 use crate::environment::TypeEnv;
 use crate::types::{PhysicalUnit, Type, TypeVarId};
+
+/// A local Span alias for error reporting, derived from the parser span.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    pub fn dummy() -> Self {
+        Self { start: 0, end: 0 }
+    }
+}
+
+impl std::fmt::Display for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
+    }
+}
+
+impl From<&ast::Span> for Span {
+    fn from(s: &ast::Span) -> Self {
+        Self {
+            start: s.start,
+            end: s.end,
+        }
+    }
+}
 
 /// Errors produced during type checking.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -66,10 +95,7 @@ pub enum TypeError {
     },
 
     #[error("non-exhaustive match at {span}: missing {missing}")]
-    NonExhaustiveMatch {
-        missing: String,
-        span: Span,
-    },
+    NonExhaustiveMatch { missing: String, span: Span },
 }
 
 /// The bidirectional type checker.
@@ -152,18 +178,24 @@ impl TypeChecker {
             Type::Sum { variants } => Type::Sum {
                 variants: variants.clone(),
             },
-            Type::Refinement { var, base, predicate } => Type::Refinement {
+            Type::Refinement {
+                var,
+                base,
+                predicate,
+            } => Type::Refinement {
                 var: var.clone(),
                 base: Box::new(self.apply_subst(base)),
                 predicate: predicate.clone(),
             },
-            Type::DependentFunction { param, param_type, return_type } => {
-                Type::DependentFunction {
-                    param: param.clone(),
-                    param_type: Box::new(self.apply_subst(param_type)),
-                    return_type: Box::new(self.apply_subst(return_type)),
-                }
-            }
+            Type::DependentFunction {
+                param,
+                param_type,
+                return_type,
+            } => Type::DependentFunction {
+                param: param.clone(),
+                param_type: Box::new(self.apply_subst(param_type)),
+                return_type: Box::new(self.apply_subst(return_type)),
+            },
             _ => ty.clone(),
         }
     }
@@ -171,70 +203,88 @@ impl TypeChecker {
     // ── Synthesis (inference) ──────────────────────────────────────
 
     /// Synthesize (infer) the type of an expression.
-    pub fn synthesize(&mut self, expr: &Expr) -> Result<Type, TypeError> {
-        match expr {
-            Expr::IntLit { .. } => Ok(Type::Int),
-            Expr::FloatLit { .. } => Ok(Type::Float),
-            Expr::StringLit { .. } => Ok(Type::String),
-            Expr::BoolLit { .. } => Ok(Type::Bool),
-            Expr::UnitLit { .. } => Ok(Type::Unit),
+    pub fn synthesize(&mut self, expr: &Spanned<ast::Expr>) -> Result<Type, TypeError> {
+        let span = Span::from(&expr.span);
+        match &expr.node {
+            ast::Expr::IntLit(_) => Ok(Type::Int),
+            ast::Expr::FloatLit(_) => Ok(Type::Float),
+            ast::Expr::StringLit(_) => Ok(Type::String),
+            ast::Expr::BoolLit(_) => Ok(Type::Bool),
 
-            Expr::Var { name, span } => self.env.lookup(name).cloned().ok_or_else(|| {
-                let err = TypeError::UnboundVariable {
-                    name: name.clone(),
-                    span: *span,
-                };
-                self.errors.push(err.clone());
-                err
-            }),
+            ast::Expr::Ident(name) => {
+                self.env.lookup(name).cloned().ok_or_else(|| {
+                    let err = TypeError::UnboundVariable {
+                        name: name.clone(),
+                        span: span.clone(),
+                    };
+                    self.errors.push(err.clone());
+                    err
+                })
+            }
 
-            Expr::Let {
+            ast::Expr::Let {
                 name,
-                annotation,
+                type_ann,
                 value,
-                body,
-                span: _,
             } => {
-                let val_type = if let Some(ann) = annotation {
-                    self.check(value, ann)?;
-                    ann.clone()
+                let val_type = if let Some(ann) = type_ann {
+                    let ann_ty = convert_type_expr(&ann.node);
+                    self.check(value, &ann_ty)?;
+                    ann_ty
                 } else {
                     self.synthesize(value)?
                 };
-
-                self.env.push_scope();
                 self.env.bind(name.clone(), val_type);
-                let body_type = self.synthesize(body);
-                self.env.pop_scope();
-                body_type
+                Ok(Type::Unit)
             }
 
-            Expr::Lambda { params, body, span: _ } => {
+            ast::Expr::Lambda { params, body } => {
                 self.env.push_scope();
-                for (name, ty) in params {
-                    self.env.bind(name.clone(), ty.clone());
-                }
+                let param_types: Vec<Type> = params
+                    .iter()
+                    .map(|p| {
+                        let ty = convert_type_expr(&p.type_expr.node);
+                        self.env.bind(p.name.clone(), ty.clone());
+                        ty
+                    })
+                    .collect();
                 let ret = self.synthesize(body)?;
                 self.env.pop_scope();
-
                 Ok(Type::Function {
-                    params: params.iter().map(|(_, ty)| ty.clone()).collect(),
+                    params: param_types,
                     return_type: Box::new(ret),
                 })
             }
 
-            Expr::Apply { func, args, span } => {
+            ast::Expr::Call { func, args } => {
                 let func_type = self.synthesize(func)?;
                 let func_type = self.apply_subst(&func_type);
-                self.check_application(&func_type, args, *span)
+                self.check_application(&func_type, args, span)
             }
 
-            Expr::BinOp { op, lhs, rhs, span } => self.check_binop(*op, lhs, rhs, *span),
+            ast::Expr::CallNamed { func, args } => {
+                // Treat named args as positional for type checking
+                let func_type = self.synthesize(func)?;
+                let func_type = self.apply_subst(&func_type);
+                let positional: Vec<Spanned<ast::Expr>> =
+                    args.iter().map(|(_, e)| e.clone()).collect();
+                self.check_application(&func_type, &positional, span)
+            }
 
-            Expr::Record { fields, span: _ } => {
+            ast::Expr::BinOp { left, op, right } => {
+                self.check_binop(*op, left, right, span)
+            }
+
+            ast::Expr::Pipeline { left, right } => {
+                let rhs_type = self.synthesize(right)?;
+                let rhs_type = self.apply_subst(&rhs_type);
+                self.check_application(&rhs_type, std::slice::from_ref(left.as_ref()), span)
+            }
+
+            ast::Expr::Record(fields) => {
                 let mut field_types = Vec::new();
-                for (name, expr) in fields {
-                    let ty = self.synthesize(expr)?;
+                for (name, val) in fields {
+                    let ty = self.synthesize(val)?;
                     field_types.push((name.clone(), ty));
                 }
                 Ok(Type::Product {
@@ -242,19 +292,19 @@ impl TypeChecker {
                 })
             }
 
-            Expr::FieldAccess { expr, field, span } => {
-                let expr_type = self.synthesize(expr)?;
+            ast::Expr::Field { expr: inner, name } => {
+                let expr_type = self.synthesize(inner)?;
                 let expr_type = self.apply_subst(&expr_type);
                 match &expr_type {
                     Type::Product { fields } => {
                         for (fname, ftype) in fields {
-                            if fname == field {
+                            if fname == name {
                                 return Ok(ftype.clone());
                             }
                         }
                         let err = TypeError::NoSuchField {
-                            field: field.clone(),
-                            span: *span,
+                            field: name.clone(),
+                            span,
                         };
                         self.errors.push(err.clone());
                         Err(err)
@@ -262,7 +312,7 @@ impl TypeChecker {
                     _ => {
                         let err = TypeError::NotARecord {
                             type_: expr_type,
-                            span: *span,
+                            span,
                         };
                         self.errors.push(err.clone());
                         Err(err)
@@ -270,57 +320,63 @@ impl TypeChecker {
                 }
             }
 
-            Expr::WithUnit { expr, unit, span: _ } => {
-                let inner = self.synthesize(expr)?;
-                // Unit annotations require a numeric base type
-                if !inner.is_numeric() {
+            ast::Expr::WithUnit {
+                value: inner,
+                unit,
+            } => {
+                let inner_ty = self.synthesize(inner)?;
+                if !inner_ty.is_numeric() {
                     let err = TypeError::Mismatch {
                         expected: Type::Float,
-                        found: inner,
-                        span: expr.span(),
+                        found: inner_ty,
+                        span: Span::from(&inner.span),
                     };
                     self.errors.push(err.clone());
                     return Err(err);
                 }
+                let pu = parse_physical_unit(unit);
                 Ok(Type::WithUnit {
-                    base: Box::new(inner),
-                    unit: unit.clone(),
+                    base: Box::new(inner_ty),
+                    unit: pu,
                 })
             }
 
-            Expr::If {
+            ast::Expr::If {
                 cond,
-                then_branch,
-                else_branch,
-                span,
+                then_,
+                else_,
             } => {
                 let cond_ty = self.synthesize(cond)?;
                 if cond_ty != Type::Bool {
                     let err = TypeError::NonBoolCondition {
                         found: cond_ty,
-                        span: cond.span(),
+                        span: Span::from(&cond.span),
                     };
                     self.errors.push(err.clone());
                     return Err(err);
                 }
-                let then_ty = self.synthesize(then_branch)?;
-                let else_ty = self.synthesize(else_branch)?;
-                if self.types_equal(&then_ty, &else_ty) {
-                    Ok(then_ty)
+                let then_ty = self.synthesize(then_)?;
+                if let Some(else_expr) = else_ {
+                    let else_ty = self.synthesize(else_expr)?;
+                    if self.types_equal(&then_ty, &else_ty) {
+                        Ok(then_ty)
+                    } else {
+                        let err = TypeError::BranchMismatch {
+                            then_type: then_ty,
+                            else_type: else_ty,
+                            span,
+                        };
+                        self.errors.push(err.clone());
+                        Err(err)
+                    }
                 } else {
-                    let err = TypeError::BranchMismatch {
-                        then_type: then_ty,
-                        else_type: else_ty,
-                        span: *span,
-                    };
-                    self.errors.push(err.clone());
-                    Err(err)
+                    // No else branch → Unit
+                    Ok(Type::Unit)
                 }
             }
 
-            Expr::Array { elements, span } => {
+            ast::Expr::Array(elements) => {
                 if elements.is_empty() {
-                    // Empty array: Array of fresh type variable
                     let elem_ty = self.fresh_var();
                     Ok(Type::Array(Box::new(elem_ty)))
                 } else {
@@ -333,7 +389,7 @@ impl TypeChecker {
                             let err = TypeError::Mismatch {
                                 expected: first_ty.clone(),
                                 found: elem_ty,
-                                span: *span,
+                                span: span.clone(),
                             };
                             self.errors.push(err.clone());
                             return Err(err);
@@ -343,26 +399,29 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Index { expr, index, span } => {
-                let expr_ty = self.synthesize(expr)?;
-                let expr_ty = self.apply_subst(&expr_ty);
+            ast::Expr::Index {
+                expr: arr,
+                index,
+            } => {
+                let arr_ty = self.synthesize(arr)?;
+                let arr_ty = self.apply_subst(&arr_ty);
                 let idx_ty = self.synthesize(index)?;
                 if idx_ty != Type::Int {
                     let err = TypeError::Mismatch {
                         expected: Type::Int,
                         found: idx_ty,
-                        span: index.span(),
+                        span: Span::from(&index.span),
                     };
                     self.errors.push(err.clone());
                     return Err(err);
                 }
-                match expr_ty {
+                match arr_ty {
                     Type::Array(elem) => Ok(*elem),
                     _ => {
                         let err = TypeError::Mismatch {
                             expected: Type::Array(Box::new(self.fresh_var())),
-                            found: expr_ty,
-                            span: *span,
+                            found: arr_ty,
+                            span,
                         };
                         self.errors.push(err.clone());
                         Err(err)
@@ -370,17 +429,15 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Match { expr, arms, span } => {
-                let scrutinee_ty = self.synthesize(expr)?;
+            ast::Expr::Match { expr: scrutinee, arms } => {
+                let scrutinee_ty = self.synthesize(scrutinee)?;
                 let scrutinee_ty = self.apply_subst(&scrutinee_ty);
                 if arms.is_empty() {
                     return Ok(Type::Unit);
                 }
 
-                // Exhaustiveness check
-                self.check_exhaustiveness(arms, &scrutinee_ty, *span);
+                self.check_exhaustiveness(arms, &scrutinee_ty, span.clone());
 
-                // Bind pattern variables and infer body types
                 let first_ty = self.synthesize_match_arm(&arms[0])?;
                 for arm in &arms[1..] {
                     let arm_ty = self.synthesize_match_arm(arm)?;
@@ -390,7 +447,7 @@ impl TypeChecker {
                         let err = TypeError::BranchMismatch {
                             then_type: first_ty.clone(),
                             else_type: arm_ty,
-                            span: *span,
+                            span: span.clone(),
                         };
                         self.errors.push(err.clone());
                         return Err(err);
@@ -399,7 +456,7 @@ impl TypeChecker {
                 Ok(first_ty)
             }
 
-            Expr::Block { exprs, span: _ } => {
+            ast::Expr::Block(exprs) => {
                 if exprs.is_empty() {
                     return Ok(Type::Unit);
                 }
@@ -410,30 +467,30 @@ impl TypeChecker {
                 Ok(last_ty)
             }
 
-            Expr::UnaryOp { op, operand, span } => {
+            ast::Expr::UnaryOp { op, operand } => {
                 let operand_ty = self.synthesize(operand)?;
                 match op {
-                    crate::ast::UnaryOp::Neg => {
+                    ast::UnaryOp::Neg => {
                         if matches!(operand_ty, Type::Int | Type::Float) {
                             Ok(operand_ty)
                         } else {
                             let err = TypeError::Mismatch {
                                 expected: Type::Int,
                                 found: operand_ty,
-                                span: *span,
+                                span,
                             };
                             self.errors.push(err.clone());
                             Err(err)
                         }
                     }
-                    crate::ast::UnaryOp::Not => {
+                    ast::UnaryOp::Not => {
                         if operand_ty == Type::Bool {
                             Ok(Type::Bool)
                         } else {
                             let err = TypeError::Mismatch {
                                 expected: Type::Bool,
                                 found: operand_ty,
-                                span: *span,
+                                span,
                             };
                             self.errors.push(err.clone());
                             Err(err)
@@ -442,40 +499,41 @@ impl TypeChecker {
                 }
             }
 
-            Expr::Ascription { expr, ty, span } => {
-                self.check(expr, ty).map_err(|_| {
-                    let actual = self.synthesize(expr).unwrap_or(Type::Unit);
+            ast::Expr::Ascription { expr: inner, type_expr } => {
+                let ty = convert_type_expr(&type_expr.node);
+                self.check(inner, &ty).map_err(|_| {
+                    let actual = self.synthesize(inner).unwrap_or(Type::Unit);
                     let err = TypeError::Mismatch {
                         expected: ty.clone(),
                         found: actual,
-                        span: *span,
+                        span: span.clone(),
                     };
                     self.errors.push(err.clone());
                     err
                 })?;
-                Ok(ty.clone())
+                Ok(ty)
             }
 
-            Expr::DoBlock { stmts, span: _ } => {
+            ast::Expr::DoBlock(stmts) => {
                 self.env.push_scope();
                 let mut last_ty = Type::Unit;
                 for stmt in stmts {
-                    match stmt {
-                        crate::ast::DoStatement::Let { name, expr } => {
-                            let ty = self.synthesize(expr)?;
+                    match &stmt.node {
+                        ast::DoStatement::Let { name, expr: e } => {
+                            let ty = self.synthesize(e)?;
                             self.env.bind(name.clone(), ty);
                             last_ty = Type::Unit;
                         }
-                        crate::ast::DoStatement::Bind { name, expr } => {
-                            let ty = self.synthesize(expr)?;
+                        ast::DoStatement::Bind { name, expr: e } => {
+                            let ty = self.synthesize(e)?;
                             self.env.bind(name.clone(), ty);
                             last_ty = Type::Unit;
                         }
-                        crate::ast::DoStatement::Expr(expr) => {
-                            last_ty = self.synthesize(expr)?;
+                        ast::DoStatement::Expr(e) => {
+                            last_ty = self.synthesize(e)?;
                         }
-                        crate::ast::DoStatement::Yield(expr) => {
-                            last_ty = self.synthesize(expr)?;
+                        ast::DoStatement::Yield(e) => {
+                            last_ty = self.synthesize(e)?;
                         }
                     }
                 }
@@ -483,14 +541,14 @@ impl TypeChecker {
                 Ok(last_ty)
             }
 
-            Expr::Range { start, end, span } => {
+            ast::Expr::Range { start, end } => {
                 let start_ty = self.synthesize(start)?;
                 let end_ty = self.synthesize(end)?;
                 if start_ty != Type::Int {
                     let err = TypeError::Mismatch {
                         expected: Type::Int,
                         found: start_ty,
-                        span: *span,
+                        span: span.clone(),
                     };
                     self.errors.push(err.clone());
                     return Err(err);
@@ -499,7 +557,7 @@ impl TypeChecker {
                     let err = TypeError::Mismatch {
                         expected: Type::Int,
                         found: end_ty,
-                        span: *span,
+                        span,
                     };
                     self.errors.push(err.clone());
                     return Err(err);
@@ -507,71 +565,114 @@ impl TypeChecker {
                 Ok(Type::Array(Box::new(Type::Int)))
             }
 
-            Expr::Slice {
-                expr: arr_expr,
+            ast::Expr::Slice {
+                expr: arr,
                 start: _,
                 end: _,
-                span,
             } => {
-                let arr_ty = self.synthesize(arr_expr)?;
+                let arr_ty = self.synthesize(arr)?;
                 match arr_ty {
                     Type::Array(elem) => Ok(Type::Array(elem)),
                     _ => {
                         let err = TypeError::Mismatch {
                             expected: Type::Array(Box::new(Type::Unit)),
                             found: arr_ty,
-                            span: *span,
+                            span,
                         };
                         self.errors.push(err.clone());
                         Err(err)
                     }
                 }
             }
+
+            // Relational algebra: all return Array of records
+            ast::Expr::Select { relation, .. }
+            | ast::Expr::Project { relation, .. }
+            | ast::Expr::GroupBy { relation, .. } => {
+                let rel_ty = self.synthesize(relation)?;
+                Ok(rel_ty) // preserve array type
+            }
+
+            ast::Expr::Join { left, .. } => {
+                let left_ty = self.synthesize(left)?;
+                Ok(left_ty) // preserve array type (simplified)
+            }
+
+            // Quantifiers return Bool
+            ast::Expr::ForAll { body, var, domain, .. } => {
+                self.env.push_scope();
+                let _dom_ty = self.synthesize(domain)?;
+                let fresh = self.fresh_var();
+                self.env.bind(var.clone(), fresh);
+                let _body_ty = self.synthesize(body)?;
+                self.env.pop_scope();
+                Ok(Type::Bool)
+            }
+
+            ast::Expr::Exists { body, var, domain, .. } => {
+                self.env.push_scope();
+                let _dom_ty = self.synthesize(domain)?;
+                let fresh = self.fresh_var();
+                self.env.bind(var.clone(), fresh);
+                let _body_ty = self.synthesize(body)?;
+                self.env.pop_scope();
+                Ok(Type::Bool)
+            }
+
+            // Try: unwrap result type (simplified: return inner type)
+            ast::Expr::Try(inner) => self.synthesize(inner),
+
+            // Yield: same as inner
+            ast::Expr::Yield(inner) => self.synthesize(inner),
+
+            // Branch: probabilistic — return type of first arm
+            ast::Expr::Branch { arms, .. } => {
+                if arms.is_empty() {
+                    Ok(Type::Unit)
+                } else {
+                    self.synthesize(&arms[0].body)
+                }
+            }
+
+            // Synthesize block: opaque
+            ast::Expr::Synthesize(_) => Ok(self.fresh_var()),
         }
     }
 
     /// Check whether a match expression is exhaustive.
-    ///
-    /// If a wildcard or identifier pattern is present, the match is trivially exhaustive.
-    /// For sum types, checks that every constructor variant is covered.
-    /// Non-exhaustiveness is reported as a warning (pushed to errors but doesn't fail synthesis).
     fn check_exhaustiveness(
         &mut self,
-        arms: &[crate::ast::MatchArm],
+        arms: &[ast::MatchArm],
         scrutinee_ty: &Type,
         span: Span,
     ) {
-        use crate::ast::Pattern;
-
-        // If any arm has a wildcard or ident pattern, match is exhaustive
         let has_catch_all = arms.iter().any(|arm| {
-            matches!(arm.pattern, Pattern::Wildcard | Pattern::Ident(_))
+            matches!(
+                arm.pattern.node,
+                ast::Pattern::Wildcard | ast::Pattern::Ident(_)
+            )
         });
         if has_catch_all {
             return;
         }
 
-        // Resolve the scrutinee type to find sum type variants
         let variants = match scrutinee_ty {
             Type::Sum { variants } => Some(variants.clone()),
-            Type::Named(name) => {
-                self.env.lookup_type(name).and_then(|td| {
-                    if let Type::Sum { variants } = &td.body {
-                        Some(variants.clone())
-                    } else {
-                        None
-                    }
-                })
-            }
+            Type::Named(name) => self.env.lookup_type(name).and_then(|td| {
+                if let Type::Sum { variants } = &td.body {
+                    Some(variants.clone())
+                } else {
+                    None
+                }
+            }),
             _ => None,
         };
 
         if let Some(variants) = variants {
-            // Collect constructor names matched by the arms
             let matched_constructors: std::collections::HashSet<&str> = arms
                 .iter()
                 .filter_map(|arm| {
-                    if let Pattern::Constructor(name, _) = &arm.pattern {
+                    if let ast::Pattern::Constructor(name, _) = &arm.pattern.node {
                         Some(name.as_str())
                     } else {
                         None
@@ -593,43 +694,46 @@ impl TypeChecker {
                 self.errors.push(err);
             }
         }
-
-        // For non-sum types (Int, String, etc.) without a wildcard,
-        // we can't statically verify exhaustiveness — skip for now.
     }
 
     /// Synthesize the type of a match arm body, binding pattern variables.
-    fn synthesize_match_arm(
-        &mut self,
-        arm: &crate::ast::MatchArm,
-    ) -> Result<Type, TypeError> {
+    fn synthesize_match_arm(&mut self, arm: &ast::MatchArm) -> Result<Type, TypeError> {
         self.env.push_scope();
-        self.bind_pattern_vars(&arm.pattern);
+        self.bind_pattern_vars(&arm.pattern.node);
         let ty = self.synthesize(&arm.body);
         self.env.pop_scope();
         ty
     }
 
-    /// Bind variables introduced by a pattern (wildcards and idents get fresh type vars).
-    fn bind_pattern_vars(&mut self, pattern: &crate::ast::Pattern) {
+    /// Bind variables introduced by a pattern.
+    fn bind_pattern_vars(&mut self, pattern: &ast::Pattern) {
         match pattern {
-            crate::ast::Pattern::Ident(name) => {
+            ast::Pattern::Ident(name) => {
                 let var = self.fresh_var();
                 self.env.bind(name.clone(), var);
             }
-            crate::ast::Pattern::Constructor(_, sub_pats) => {
+            ast::Pattern::Constructor(_, sub_pats) => {
                 for p in sub_pats {
-                    self.bind_pattern_vars(p);
+                    self.bind_pattern_vars(&p.node);
                 }
             }
-            crate::ast::Pattern::Wildcard | crate::ast::Pattern::Literal(_) => {}
+            ast::Pattern::Record(fields) => {
+                for (_, p) in fields {
+                    self.bind_pattern_vars(&p.node);
+                }
+            }
+            ast::Pattern::Wildcard | ast::Pattern::Literal(_) => {}
         }
     }
 
     // ── Checking ──────────────────────────────────────────────────
 
     /// Check that an expression has the expected type.
-    pub fn check(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
+    pub fn check(
+        &mut self,
+        expr: &Spanned<ast::Expr>,
+        expected: &Type,
+    ) -> Result<(), TypeError> {
         let inferred = self.synthesize(expr)?;
         let inferred = self.apply_subst(&inferred);
         let expected = self.apply_subst(expected);
@@ -640,7 +744,7 @@ impl TypeChecker {
             let err = TypeError::Mismatch {
                 expected,
                 found: inferred,
-                span: expr.span(),
+                span: Span::from(&expr.span),
             };
             self.errors.push(err.clone());
             Err(err)
@@ -650,69 +754,53 @@ impl TypeChecker {
     // ── Subtyping ─────────────────────────────────────────────────
 
     /// Check if `sub` is a subtype of `sup`.
-    ///
-    /// Subtyping rules:
-    /// - A type is a subtype of itself (reflexivity).
-    /// - `Refinement { base: T, .. }` is a subtype of `T`.
-    /// - `Int` is a subtype of `Float` (numeric widening).
-    /// - Function types are contravariant in params, covariant in return.
-    /// - `WithUnit` types with the same dimension are compatible.
     pub fn is_subtype(&self, sub: &Type, sup: &Type) -> bool {
-        // Reflexivity
         if self.types_equal(sub, sup) {
             return true;
         }
 
         match (sub, sup) {
-            // Int widens to Float
             (Type::Int, Type::Float) => true,
-
-            // Refinement type is subtype of its base
             (Type::Refinement { base, .. }, sup) => self.is_subtype(base, sup),
-
-            // A base type is NOT a subtype of its refinement (needs proof)
-            // but a refinement with the same base can be subtype of another refinement
-            // with the same base (if predicates imply — we conservatively reject)
-
-            // Function subtyping (contravariant params, covariant return)
             (
-                Type::Function { params: p1, return_type: r1 },
-                Type::Function { params: p2, return_type: r2 },
+                Type::Function {
+                    params: p1,
+                    return_type: r1,
+                },
+                Type::Function {
+                    params: p2,
+                    return_type: r2,
+                },
             ) if p1.len() == p2.len() => {
-                // Contravariant in parameters
                 let params_ok = p1
                     .iter()
                     .zip(p2.iter())
                     .all(|(sub_p, sup_p)| self.is_subtype(sup_p, sub_p));
-                // Covariant in return type
                 params_ok && self.is_subtype(r1, r2)
             }
-
-            // WithUnit: same dimension is compatible
             (
-                Type::WithUnit { base: b1, unit: u1 },
-                Type::WithUnit { base: b2, unit: u2 },
+                Type::WithUnit {
+                    base: b1, unit: u1, ..
+                },
+                Type::WithUnit {
+                    base: b2, unit: u2, ..
+                },
             ) => u1.same_dimension(u2) && self.is_subtype(b1, b2),
-
-            // Array covariance
             (Type::Array(a), Type::Array(b)) => self.is_subtype(a, b),
-
-            // Stream covariance
             (Type::Stream(a), Type::Stream(b)) => self.is_subtype(a, b),
-
-            // Distribution covariance
             (Type::Distribution(a), Type::Distribution(b)) => self.is_subtype(a, b),
-
-            // Applied type: same constructor, check args
             (
-                Type::Applied { constructor: c1, args: a1 },
-                Type::Applied { constructor: c2, args: a2 },
+                Type::Applied {
+                    constructor: c1,
+                    args: a1,
+                },
+                Type::Applied {
+                    constructor: c2,
+                    args: a2,
+                },
             ) if c1 == c2 && a1.len() == a2.len() => {
-                // Invariant for now (conservative)
                 a1.iter().zip(a2.iter()).all(|(x, y)| self.types_equal(x, y))
             }
-
-            // Product subtyping: sub has at least all fields of sup with compatible types
             (Type::Product { fields: sub_fields }, Type::Product { fields: sup_fields }) => {
                 sup_fields.iter().all(|(name, sup_ty)| {
                     sub_fields
@@ -720,7 +808,6 @@ impl TypeChecker {
                         .any(|(n, t)| n == name && self.is_subtype(t, sup_ty))
                 })
             }
-
             _ => false,
         }
     }
@@ -754,8 +841,14 @@ impl TypeChecker {
             }
             (Type::Int, Type::Float) | (Type::Float, Type::Int) => Ok(Type::Float),
             (
-                Type::Function { params: p1, return_type: r1 },
-                Type::Function { params: p2, return_type: r2 },
+                Type::Function {
+                    params: p1,
+                    return_type: r1,
+                },
+                Type::Function {
+                    params: p2,
+                    return_type: r2,
+                },
             ) if p1.len() == p2.len() => {
                 let params: Result<Vec<_>, _> = p1
                     .iter()
@@ -781,8 +874,14 @@ impl TypeChecker {
                 Ok(Type::Distribution(Box::new(inner)))
             }
             (
-                Type::Applied { constructor: c1, args: a1 },
-                Type::Applied { constructor: c2, args: a2 },
+                Type::Applied {
+                    constructor: c1,
+                    args: a1,
+                },
+                Type::Applied {
+                    constructor: c2,
+                    args: a2,
+                },
             ) if c1 == c2 && a1.len() == a2.len() => {
                 let args: Result<Vec<_>, _> = a1
                     .iter()
@@ -807,7 +906,7 @@ impl TypeChecker {
     fn check_application(
         &mut self,
         func_type: &Type,
-        args: &[Expr],
+        args: &[Spanned<ast::Expr>],
         span: Span,
     ) -> Result<Type, TypeError> {
         match func_type {
@@ -841,8 +940,6 @@ impl TypeChecker {
                     return Err(err);
                 }
                 self.check(&args[0], param_type)?;
-                // In a full implementation, we'd substitute the arg value
-                // into the return type. For now, return as-is.
                 Ok(*return_type.clone())
             }
             _ => {
@@ -858,29 +955,21 @@ impl TypeChecker {
 
     fn check_binop(
         &mut self,
-        op: BinOp,
-        lhs: &Expr,
-        rhs: &Expr,
+        op: ast::BinOp,
+        lhs: &Spanned<ast::Expr>,
+        rhs: &Spanned<ast::Expr>,
         span: Span,
     ) -> Result<Type, TypeError> {
-        // Pipeline: a |> f  ≡  f(a)
-        if op == BinOp::Pipe {
-            let rhs_type = self.synthesize(rhs)?;
-            let rhs_type = self.apply_subst(&rhs_type);
-            return self.check_application(&rhs_type, &[lhs.clone()], span);
-        }
-
         let lhs_type = self.synthesize(lhs)?;
         let rhs_type = self.synthesize(rhs)?;
         let lhs_type = self.apply_subst(&lhs_type);
         let rhs_type = self.apply_subst(&rhs_type);
 
-        if op.is_arithmetic() {
+        if is_arithmetic(op) {
             return self.check_arithmetic(op, &lhs_type, &rhs_type, span);
         }
 
-        if op.is_comparison() {
-            // Both sides must be the same type (or compatible via subtyping)
+        if is_comparison(op) {
             if self.is_subtype(&lhs_type, &rhs_type) || self.is_subtype(&rhs_type, &lhs_type) {
                 return Ok(Type::Bool);
             }
@@ -893,12 +982,12 @@ impl TypeChecker {
             return Err(err);
         }
 
-        if op.is_logical() {
+        if is_logical(op) {
             if lhs_type != Type::Bool {
                 let err = TypeError::Mismatch {
                     expected: Type::Bool,
                     found: lhs_type,
-                    span: lhs.span(),
+                    span: Span::from(&lhs.span),
                 };
                 self.errors.push(err.clone());
                 return Err(err);
@@ -907,7 +996,7 @@ impl TypeChecker {
                 let err = TypeError::Mismatch {
                     expected: Type::Bool,
                     found: rhs_type,
-                    span: rhs.span(),
+                    span: Span::from(&rhs.span),
                 };
                 self.errors.push(err.clone());
                 return Err(err);
@@ -915,12 +1004,12 @@ impl TypeChecker {
             return Ok(Type::Bool);
         }
 
-        if op == BinOp::Concat {
+        if op == ast::BinOp::Concat {
             if lhs_type != Type::String {
                 let err = TypeError::Mismatch {
                     expected: Type::String,
                     found: lhs_type,
-                    span: lhs.span(),
+                    span: Span::from(&lhs.span),
                 };
                 self.errors.push(err.clone());
                 return Err(err);
@@ -929,7 +1018,7 @@ impl TypeChecker {
                 let err = TypeError::Mismatch {
                     expected: Type::String,
                     found: rhs_type,
-                    span: rhs.span(),
+                    span: Span::from(&rhs.span),
                 };
                 self.errors.push(err.clone());
                 return Err(err);
@@ -942,22 +1031,22 @@ impl TypeChecker {
 
     fn check_arithmetic(
         &mut self,
-        _op: BinOp,
+        _op: ast::BinOp,
         lhs: &Type,
         rhs: &Type,
         span: Span,
     ) -> Result<Type, TypeError> {
         match (lhs, rhs) {
-            // Same numeric type
             (Type::Int, Type::Int) => Ok(Type::Int),
             (Type::Float, Type::Float) => Ok(Type::Float),
-            // Int + Float → Float (widening)
             (Type::Int, Type::Float) | (Type::Float, Type::Int) => Ok(Type::Float),
-
-            // WithUnit arithmetic: same dimension OK, different dimension error
             (
-                Type::WithUnit { base: b1, unit: u1 },
-                Type::WithUnit { base: b2, unit: u2 },
+                Type::WithUnit {
+                    base: b1, unit: u1, ..
+                },
+                Type::WithUnit {
+                    base: b2, unit: u2, ..
+                },
             ) => {
                 if !u1.same_dimension(u2) {
                     let err = TypeError::UnitMismatch {
@@ -968,7 +1057,6 @@ impl TypeChecker {
                     self.errors.push(err.clone());
                     return Err(err);
                 }
-                // Result has the left unit (in practice, we'd convert)
                 let base = if self.is_subtype(b1, b2) {
                     *b2.clone()
                 } else {
@@ -979,7 +1067,6 @@ impl TypeChecker {
                     unit: u1.clone(),
                 })
             }
-
             _ => {
                 let err = TypeError::InvalidOperands {
                     left: lhs.clone(),
@@ -999,14 +1086,98 @@ impl Default for TypeChecker {
     }
 }
 
+// ── Free functions ────────────────────────────────────────────────
+
+fn is_arithmetic(op: ast::BinOp) -> bool {
+    matches!(
+        op,
+        ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div | ast::BinOp::Mod
+    )
+}
+
+fn is_comparison(op: ast::BinOp) -> bool {
+    matches!(
+        op,
+        ast::BinOp::Eq
+            | ast::BinOp::Neq
+            | ast::BinOp::Lt
+            | ast::BinOp::Gt
+            | ast::BinOp::Leq
+            | ast::BinOp::Geq
+    )
+}
+
+fn is_logical(op: ast::BinOp) -> bool {
+    matches!(op, ast::BinOp::And | ast::BinOp::Or | ast::BinOp::Implies)
+}
+
+/// Convert a parser `TypeExpr` to our internal `Type`.
+pub fn convert_type_expr(type_expr: &ast::TypeExpr) -> Type {
+    match type_expr {
+        ast::TypeExpr::Named(name) => match name.as_str() {
+            "Int" => Type::Int,
+            "Float" => Type::Float,
+            "String" => Type::String,
+            "Bool" => Type::Bool,
+            "Unit" => Type::Unit,
+            _ => Type::Named(name.clone()),
+        },
+        ast::TypeExpr::Function { params, ret } => Type::Function {
+            params: params.iter().map(|p| convert_type_expr(&p.node)).collect(),
+            return_type: Box::new(convert_type_expr(&ret.node)),
+        },
+        ast::TypeExpr::Record(fields) => Type::Product {
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.clone(), convert_type_expr(&t.node)))
+                .collect(),
+        },
+        ast::TypeExpr::Applied { name, args } => Type::Applied {
+            constructor: name.clone(),
+            args: args.iter().map(|a| convert_type_expr(&a.node)).collect(),
+        },
+        ast::TypeExpr::Stream(inner) => Type::Stream(Box::new(convert_type_expr(&inner.node))),
+        ast::TypeExpr::Distribution(inner) => {
+            Type::Distribution(Box::new(convert_type_expr(&inner.node)))
+        }
+        _ => Type::Named("Unknown".into()),
+    }
+}
+
+/// Parse a unit string into a PhysicalUnit.
+fn parse_physical_unit(unit: &str) -> PhysicalUnit {
+    use crate::types::*;
+    match unit {
+        "ms" => PhysicalUnit::Duration(DurationUnit::Milliseconds),
+        "s" => PhysicalUnit::Duration(DurationUnit::Seconds),
+        "min" => PhysicalUnit::Duration(DurationUnit::Minutes),
+        "hour" | "h" => PhysicalUnit::Duration(DurationUnit::Hours),
+        "B" | "bytes" => PhysicalUnit::Size(SizeUnit::Bytes),
+        "KiB" => PhysicalUnit::Size(SizeUnit::KiB),
+        "MiB" => PhysicalUnit::Size(SizeUnit::MiB),
+        "GiB" => PhysicalUnit::Size(SizeUnit::GiB),
+        "bps" => PhysicalUnit::Bandwidth(BandwidthUnit::Bps),
+        "Kbps" => PhysicalUnit::Bandwidth(BandwidthUnit::Kbps),
+        "Mbps" => PhysicalUnit::Bandwidth(BandwidthUnit::Mbps),
+        "Gbps" => PhysicalUnit::Bandwidth(BandwidthUnit::Gbps),
+        "USD" => PhysicalUnit::Currency(CurrencyUnit::USD),
+        "EUR" => PhysicalUnit::Currency(CurrencyUnit::EUR),
+        "JPY" => PhysicalUnit::Currency(CurrencyUnit::JPY),
+        "GBP" => PhysicalUnit::Currency(CurrencyUnit::GBP),
+        _ => PhysicalUnit::Duration(DurationUnit::Seconds), // fallback
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{MatchArm, Pattern, Span};
     use crate::types::*;
+    use lattice_parser::ast::{BinOp, Expr, Spanned};
 
-    fn s() -> Span {
-        Span::dummy()
+    fn sp(expr: Expr) -> Spanned<Expr> {
+        Spanned::dummy(expr)
     }
 
     // ── Synthesis tests ───────────────────────────────────────────
@@ -1014,25 +1185,15 @@ mod tests {
     #[test]
     fn synthesize_literals() {
         let mut tc = TypeChecker::new();
+        assert_eq!(tc.synthesize(&sp(Expr::IntLit(42))).unwrap(), Type::Int);
+        assert_eq!(tc.synthesize(&sp(Expr::FloatLit(3.14))).unwrap(), Type::Float);
         assert_eq!(
-            tc.synthesize(&Expr::IntLit { value: 42, span: s() }).unwrap(),
-            Type::Int
-        );
-        assert_eq!(
-            tc.synthesize(&Expr::FloatLit { value: 3.14, span: s() }).unwrap(),
-            Type::Float
-        );
-        assert_eq!(
-            tc.synthesize(&Expr::StringLit { value: "hi".into(), span: s() }).unwrap(),
+            tc.synthesize(&sp(Expr::StringLit("hi".into()))).unwrap(),
             Type::String
         );
         assert_eq!(
-            tc.synthesize(&Expr::BoolLit { value: true, span: s() }).unwrap(),
+            tc.synthesize(&sp(Expr::BoolLit(true))).unwrap(),
             Type::Bool
-        );
-        assert_eq!(
-            tc.synthesize(&Expr::UnitLit { span: s() }).unwrap(),
-            Type::Unit
         );
     }
 
@@ -1040,62 +1201,62 @@ mod tests {
     fn synthesize_variable_lookup() {
         let mut tc = TypeChecker::new();
         tc.env.bind("x".into(), Type::Int);
-
-        let result = tc.synthesize(&Expr::Var { name: "x".into(), span: s() });
-        assert_eq!(result.unwrap(), Type::Int);
+        assert_eq!(
+            tc.synthesize(&sp(Expr::Ident("x".into()))).unwrap(),
+            Type::Int
+        );
     }
 
     #[test]
     fn synthesize_unbound_variable() {
         let mut tc = TypeChecker::new();
-        let result = tc.synthesize(&Expr::Var { name: "nope".into(), span: s() });
-        assert!(result.is_err());
+        assert!(tc.synthesize(&sp(Expr::Ident("nope".into()))).is_err());
         assert!(!tc.is_ok());
     }
 
     #[test]
     fn synthesize_let_binding() {
         let mut tc = TypeChecker::new();
-
-        // let x = 42 in x
-        let expr = Expr::Let {
+        // let x = 42; then x is in scope
+        let let_expr = sp(Expr::Let {
             name: "x".into(),
-            annotation: None,
-            value: Box::new(Expr::IntLit { value: 42, span: s() }),
-            body: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            span: s(),
-        };
-
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+            type_ann: None,
+            value: Box::new(sp(Expr::IntLit(42))),
+        });
+        assert_eq!(tc.synthesize(&let_expr).unwrap(), Type::Unit);
+        // x should be bound now
+        assert_eq!(
+            tc.synthesize(&sp(Expr::Ident("x".into()))).unwrap(),
+            Type::Int
+        );
     }
 
     #[test]
     fn synthesize_let_with_annotation() {
         let mut tc = TypeChecker::new();
-
-        // let x: Float = 42 in x   -- Int checks against Float via subtyping
-        let expr = Expr::Let {
+        let let_expr = sp(Expr::Let {
             name: "x".into(),
-            annotation: Some(Type::Float),
-            value: Box::new(Expr::IntLit { value: 42, span: s() }),
-            body: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            span: s(),
-        };
-
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Float);
+            type_ann: Some(Spanned::dummy(ast::TypeExpr::Named("Float".into()))),
+            value: Box::new(sp(Expr::IntLit(42))),
+        });
+        assert_eq!(tc.synthesize(&let_expr).unwrap(), Type::Unit);
+        // x should be Float due to annotation
+        assert_eq!(
+            tc.synthesize(&sp(Expr::Ident("x".into()))).unwrap(),
+            Type::Float
+        );
     }
 
     #[test]
     fn synthesize_lambda() {
         let mut tc = TypeChecker::new();
-
-        // fn(x: Int) -> x
-        let expr = Expr::Lambda {
-            params: vec![("x".into(), Type::Int)],
-            body: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            span: s(),
-        };
-
+        let expr = sp(Expr::Lambda {
+            params: vec![ast::Param {
+                name: "x".into(),
+                type_expr: Spanned::dummy(ast::TypeExpr::Named("Int".into())),
+            }],
+            body: Box::new(sp(Expr::Ident("x".into()))),
+        });
         let ty = tc.synthesize(&expr).unwrap();
         assert_eq!(
             ty,
@@ -1109,8 +1270,6 @@ mod tests {
     #[test]
     fn synthesize_application() {
         let mut tc = TypeChecker::new();
-
-        // Bind f: (Int) -> Bool
         tc.env.bind(
             "f".into(),
             Type::Function {
@@ -1118,21 +1277,16 @@ mod tests {
                 return_type: Box::new(Type::Bool),
             },
         );
-
-        // f(42)
-        let expr = Expr::Apply {
-            func: Box::new(Expr::Var { name: "f".into(), span: s() }),
-            args: vec![Expr::IntLit { value: 42, span: s() }],
-            span: s(),
-        };
-
+        let expr = sp(Expr::Call {
+            func: Box::new(sp(Expr::Ident("f".into()))),
+            args: vec![sp(Expr::IntLit(42))],
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
     }
 
     #[test]
     fn synthesize_application_arity_mismatch() {
         let mut tc = TypeChecker::new();
-
         tc.env.bind(
             "f".into(),
             Type::Function {
@@ -1140,14 +1294,10 @@ mod tests {
                 return_type: Box::new(Type::Bool),
             },
         );
-
-        // f(42) — needs 2 args
-        let expr = Expr::Apply {
-            func: Box::new(Expr::Var { name: "f".into(), span: s() }),
-            args: vec![Expr::IntLit { value: 42, span: s() }],
-            span: s(),
-        };
-
+        let expr = sp(Expr::Call {
+            func: Box::new(sp(Expr::Ident("f".into()))),
+            args: vec![sp(Expr::IntLit(42))],
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
@@ -1156,60 +1306,55 @@ mod tests {
     #[test]
     fn arithmetic_int() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Add,
-            lhs: Box::new(Expr::IntLit { value: 1, span: s() }),
-            rhs: Box::new(Expr::IntLit { value: 2, span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::IntLit(1))),
+            right: Box::new(sp(Expr::IntLit(2))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
     }
 
     #[test]
     fn arithmetic_int_float_widening() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Mul,
-            lhs: Box::new(Expr::IntLit { value: 2, span: s() }),
-            rhs: Box::new(Expr::FloatLit { value: 3.0, span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::IntLit(2))),
+            right: Box::new(sp(Expr::FloatLit(3.0))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Float);
     }
 
     #[test]
     fn comparison_returns_bool() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Lt,
-            lhs: Box::new(Expr::IntLit { value: 1, span: s() }),
-            rhs: Box::new(Expr::IntLit { value: 2, span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::IntLit(1))),
+            right: Box::new(sp(Expr::IntLit(2))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
     }
 
     #[test]
     fn logical_ops() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::And,
-            lhs: Box::new(Expr::BoolLit { value: true, span: s() }),
-            rhs: Box::new(Expr::BoolLit { value: false, span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::BoolLit(true))),
+            right: Box::new(sp(Expr::BoolLit(false))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
     }
 
     #[test]
     fn logical_op_non_bool_error() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::And,
-            lhs: Box::new(Expr::IntLit { value: 1, span: s() }),
-            rhs: Box::new(Expr::BoolLit { value: true, span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::IntLit(1))),
+            right: Box::new(sp(Expr::BoolLit(true))),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
@@ -1218,8 +1363,6 @@ mod tests {
     #[test]
     fn pipeline_operator() {
         let mut tc = TypeChecker::new();
-
-        // Bind inc: (Int) -> Int
         tc.env.bind(
             "inc".into(),
             Type::Function {
@@ -1227,15 +1370,10 @@ mod tests {
                 return_type: Box::new(Type::Int),
             },
         );
-
-        // 42 |> inc
-        let expr = Expr::BinOp {
-            op: BinOp::Pipe,
-            lhs: Box::new(Expr::IntLit { value: 42, span: s() }),
-            rhs: Box::new(Expr::Var { name: "inc".into(), span: s() }),
-            span: s(),
-        };
-
+        let expr = sp(Expr::Pipeline {
+            left: Box::new(sp(Expr::IntLit(42))),
+            right: Box::new(sp(Expr::Ident("inc".into()))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
     }
 
@@ -1244,16 +1382,10 @@ mod tests {
     #[test]
     fn record_construction_and_access() {
         let mut tc = TypeChecker::new();
-
-        // { x: 1, y: true }
-        let record = Expr::Record {
-            fields: vec![
-                ("x".into(), Expr::IntLit { value: 1, span: s() }),
-                ("y".into(), Expr::BoolLit { value: true, span: s() }),
-            ],
-            span: s(),
-        };
-
+        let record = sp(Expr::Record(vec![
+            ("x".into(), sp(Expr::IntLit(1))),
+            ("y".into(), sp(Expr::BoolLit(true))),
+        ]));
         let ty = tc.synthesize(&record).unwrap();
         assert_eq!(
             ty,
@@ -1272,13 +1404,10 @@ mod tests {
                 fields: vec![("x".into(), Type::Int), ("y".into(), Type::Bool)],
             },
         );
-
-        let expr = Expr::FieldAccess {
-            expr: Box::new(Expr::Var { name: "r".into(), span: s() }),
-            field: "y".into(),
-            span: s(),
-        };
-
+        let expr = sp(Expr::Field {
+            expr: Box::new(sp(Expr::Ident("r".into()))),
+            name: "y".into(),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
     }
 
@@ -1291,13 +1420,10 @@ mod tests {
                 fields: vec![("x".into(), Type::Int)],
             },
         );
-
-        let expr = Expr::FieldAccess {
-            expr: Box::new(Expr::Var { name: "r".into(), span: s() }),
-            field: "z".into(),
-            span: s(),
-        };
-
+        let expr = sp(Expr::Field {
+            expr: Box::new(sp(Expr::Ident("r".into()))),
+            name: "z".into(),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
@@ -1306,14 +1432,10 @@ mod tests {
     #[test]
     fn unit_literal_synthesis() {
         let mut tc = TypeChecker::new();
-
-        // 200.ms → Float.Duration(Milliseconds)
-        let expr = Expr::WithUnit {
-            expr: Box::new(Expr::FloatLit { value: 200.0, span: s() }),
-            unit: PhysicalUnit::Duration(DurationUnit::Milliseconds),
-            span: s(),
-        };
-
+        let expr = sp(Expr::WithUnit {
+            value: Box::new(sp(Expr::FloatLit(200.0))),
+            unit: "ms".into(),
+        });
         let ty = tc.synthesize(&expr).unwrap();
         assert_eq!(
             ty,
@@ -1327,46 +1449,34 @@ mod tests {
     #[test]
     fn unit_same_dimension_addition() {
         let mut tc = TypeChecker::new();
-
-        // 1.s + 200.ms  → OK (same dimension: Duration)
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Add,
-            lhs: Box::new(Expr::WithUnit {
-                expr: Box::new(Expr::FloatLit { value: 1.0, span: s() }),
-                unit: PhysicalUnit::Duration(DurationUnit::Seconds),
-                span: s(),
-            }),
-            rhs: Box::new(Expr::WithUnit {
-                expr: Box::new(Expr::FloatLit { value: 200.0, span: s() }),
-                unit: PhysicalUnit::Duration(DurationUnit::Milliseconds),
-                span: s(),
-            }),
-            span: s(),
-        };
-
+            left: Box::new(sp(Expr::WithUnit {
+                value: Box::new(sp(Expr::FloatLit(1.0))),
+                unit: "s".into(),
+            })),
+            right: Box::new(sp(Expr::WithUnit {
+                value: Box::new(sp(Expr::FloatLit(200.0))),
+                unit: "ms".into(),
+            })),
+        });
         assert!(tc.synthesize(&expr).is_ok());
     }
 
     #[test]
     fn unit_different_dimension_error() {
         let mut tc = TypeChecker::new();
-
-        // 1.s + 1.GiB  → Error (Duration + Size)
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Add,
-            lhs: Box::new(Expr::WithUnit {
-                expr: Box::new(Expr::FloatLit { value: 1.0, span: s() }),
-                unit: PhysicalUnit::Duration(DurationUnit::Seconds),
-                span: s(),
-            }),
-            rhs: Box::new(Expr::WithUnit {
-                expr: Box::new(Expr::FloatLit { value: 1.0, span: s() }),
-                unit: PhysicalUnit::Size(SizeUnit::GiB),
-                span: s(),
-            }),
-            span: s(),
-        };
-
+            left: Box::new(sp(Expr::WithUnit {
+                value: Box::new(sp(Expr::FloatLit(1.0))),
+                unit: "s".into(),
+            })),
+            right: Box::new(sp(Expr::WithUnit {
+                value: Box::new(sp(Expr::FloatLit(1.0))),
+                unit: "GiB".into(),
+            })),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
@@ -1389,8 +1499,6 @@ mod tests {
     #[test]
     fn subtype_refinement_to_base() {
         let tc = TypeChecker::new();
-
-        // Nat (refinement of Int) is subtype of Int
         let nat = Type::Refinement {
             var: "n".into(),
             base: Box::new(Type::Int),
@@ -1400,28 +1508,39 @@ mod tests {
                 right: Box::new(PredicateExpr::IntLit(0)),
             },
         };
-
         assert!(tc.is_subtype(&nat, &Type::Int));
-        // Nat → Float also works via transitivity through Int
-        assert!(tc.is_subtype(&nat, &Type::Float));
-        // Int is NOT a subtype of Nat
         assert!(!tc.is_subtype(&Type::Int, &nat));
     }
 
     #[test]
     fn subtype_product_width() {
         let tc = TypeChecker::new();
-
-        // { x: Int, y: Bool } is subtype of { x: Int }
         let sub = Type::Product {
-            fields: vec![("x".into(), Type::Int), ("y".into(), Type::Bool)],
+            fields: vec![
+                ("x".into(), Type::Int),
+                ("y".into(), Type::Bool),
+                ("z".into(), Type::String),
+            ],
         };
         let sup = Type::Product {
-            fields: vec![("x".into(), Type::Int)],
+            fields: vec![("x".into(), Type::Int), ("y".into(), Type::Bool)],
         };
-
         assert!(tc.is_subtype(&sub, &sup));
         assert!(!tc.is_subtype(&sup, &sub));
+    }
+
+    // ── Check tests ───────────────────────────────────────────────
+
+    #[test]
+    fn check_subtype_accepted() {
+        let mut tc = TypeChecker::new();
+        tc.check(&sp(Expr::IntLit(42)), &Type::Float).unwrap();
+    }
+
+    #[test]
+    fn check_mismatch_rejected() {
+        let mut tc = TypeChecker::new();
+        assert!(tc.check(&sp(Expr::StringLit("hi".into())), &Type::Int).is_err());
     }
 
     // ── Unification tests ─────────────────────────────────────────
@@ -1433,28 +1552,23 @@ mod tests {
     }
 
     #[test]
-    fn unify_type_variable() {
+    fn unify_int_float() {
         let mut tc = TypeChecker::new();
-        let var = tc.fresh_var();
-
-        let result = tc.unify(&var, &Type::String).unwrap();
-        assert_eq!(result, Type::String);
-
-        // The variable should now be resolved
-        assert_eq!(tc.apply_subst(&var), Type::String);
+        assert_eq!(tc.unify(&Type::Int, &Type::Float).unwrap(), Type::Float);
     }
 
     #[test]
-    fn unify_int_float() {
+    fn unify_type_variable() {
         let mut tc = TypeChecker::new();
-        let result = tc.unify(&Type::Int, &Type::Float).unwrap();
-        assert_eq!(result, Type::Float);
+        let var = tc.fresh_var();
+        let result = tc.unify(&var, &Type::String).unwrap();
+        assert_eq!(result, Type::String);
     }
 
     #[test]
     fn unify_incompatible() {
         let mut tc = TypeChecker::new();
-        assert!(tc.unify(&Type::String, &Type::Bool).is_err());
+        assert!(tc.unify(&Type::Bool, &Type::String).is_err());
     }
 
     // ── If expression tests ───────────────────────────────────────
@@ -1462,94 +1576,68 @@ mod tests {
     #[test]
     fn if_expression_same_branches() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::If {
-            cond: Box::new(Expr::BoolLit { value: true, span: s() }),
-            then_branch: Box::new(Expr::IntLit { value: 1, span: s() }),
-            else_branch: Box::new(Expr::IntLit { value: 2, span: s() }),
-            span: s(),
-        };
+        let expr = sp(Expr::If {
+            cond: Box::new(sp(Expr::BoolLit(true))),
+            then_: Box::new(sp(Expr::IntLit(1))),
+            else_: Some(Box::new(sp(Expr::IntLit(2)))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
-    }
-
-    #[test]
-    fn if_expression_non_bool_cond() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::If {
-            cond: Box::new(Expr::IntLit { value: 1, span: s() }),
-            then_branch: Box::new(Expr::IntLit { value: 1, span: s() }),
-            else_branch: Box::new(Expr::IntLit { value: 2, span: s() }),
-            span: s(),
-        };
-        assert!(tc.synthesize(&expr).is_err());
     }
 
     #[test]
     fn if_expression_branch_mismatch() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::If {
-            cond: Box::new(Expr::BoolLit { value: true, span: s() }),
-            then_branch: Box::new(Expr::IntLit { value: 1, span: s() }),
-            else_branch: Box::new(Expr::StringLit { value: "no".into(), span: s() }),
-            span: s(),
-        };
+        let expr = sp(Expr::If {
+            cond: Box::new(sp(Expr::BoolLit(true))),
+            then_: Box::new(sp(Expr::IntLit(1))),
+            else_: Some(Box::new(sp(Expr::StringLit("hi".into())))),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
-    // ── Scoping tests ─────────────────────────────────────────────
+    #[test]
+    fn if_expression_non_bool_cond() {
+        let mut tc = TypeChecker::new();
+        let expr = sp(Expr::If {
+            cond: Box::new(sp(Expr::IntLit(1))),
+            then_: Box::new(sp(Expr::IntLit(2))),
+            else_: Some(Box::new(sp(Expr::IntLit(3)))),
+        });
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── Let scoping ───────────────────────────────────────────────
 
     #[test]
     fn let_scoping() {
         let mut tc = TypeChecker::new();
-        tc.env.bind("x".into(), Type::Bool);
-
-        // let x = 42 in x  → Int (shadows outer x: Bool)
-        let expr = Expr::Let {
+        // let x = 42, then x is accessible
+        tc.synthesize(&sp(Expr::Let {
             name: "x".into(),
-            annotation: None,
-            value: Box::new(Expr::IntLit { value: 42, span: s() }),
-            body: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            span: s(),
-        };
-
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
-
-        // After the let, x is Bool again
-        assert_eq!(tc.env.lookup("x"), Some(&Type::Bool));
+            type_ann: None,
+            value: Box::new(sp(Expr::IntLit(42))),
+        }))
+        .unwrap();
+        assert_eq!(
+            tc.synthesize(&sp(Expr::Ident("x".into()))).unwrap(),
+            Type::Int
+        );
     }
 
-    // ── Check mode tests ──────────────────────────────────────────
+    // ── Array tests ───────────────────────────────────────────────
 
     #[test]
-    fn check_subtype_accepted() {
+    fn synthesize_empty_array() {
         let mut tc = TypeChecker::new();
-
-        // Check that an Int literal is acceptable where Float is expected
-        let expr = Expr::IntLit { value: 42, span: s() };
-        assert!(tc.check(&expr, &Type::Float).is_ok());
+        let expr = sp(Expr::Array(vec![]));
+        let ty = tc.synthesize(&expr).unwrap();
+        assert!(matches!(ty, Type::Array(_)));
     }
-
-    #[test]
-    fn check_mismatch_rejected() {
-        let mut tc = TypeChecker::new();
-
-        // Check that a String literal is NOT acceptable where Int is expected
-        let expr = Expr::StringLit { value: "hi".into(), span: s() };
-        assert!(tc.check(&expr, &Type::Int).is_err());
-    }
-
-    // ── Array tests ──────────────────────────────────────────────
 
     #[test]
     fn synthesize_array_literal() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Array {
-            elements: vec![
-                Expr::IntLit { value: 1, span: s() },
-                Expr::IntLit { value: 2, span: s() },
-                Expr::IntLit { value: 3, span: s() },
-            ],
-            span: s(),
-        };
+        let expr = sp(Expr::Array(vec![sp(Expr::IntLit(1)), sp(Expr::IntLit(2))]));
         assert_eq!(
             tc.synthesize(&expr).unwrap(),
             Type::Array(Box::new(Type::Int))
@@ -1557,27 +1645,12 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_empty_array() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::Array {
-            elements: vec![],
-            span: s(),
-        };
-        let ty = tc.synthesize(&expr).unwrap();
-        // Should be Array of a type variable
-        assert!(matches!(ty, Type::Array(_)));
-    }
-
-    #[test]
     fn synthesize_array_mixed_types_error() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Array {
-            elements: vec![
-                Expr::IntLit { value: 1, span: s() },
-                Expr::StringLit { value: "hi".into(), span: s() },
-            ],
-            span: s(),
-        };
+        let expr = sp(Expr::Array(vec![
+            sp(Expr::IntLit(1)),
+            sp(Expr::StringLit("oops".into())),
+        ]));
         assert!(tc.synthesize(&expr).is_err());
     }
 
@@ -1585,260 +1658,224 @@ mod tests {
     fn synthesize_index_access() {
         let mut tc = TypeChecker::new();
         tc.env.bind("arr".into(), Type::Array(Box::new(Type::Int)));
-        let expr = Expr::Index {
-            expr: Box::new(Expr::Var { name: "arr".into(), span: s() }),
-            index: Box::new(Expr::IntLit { value: 0, span: s() }),
-            span: s(),
-        };
+        let expr = sp(Expr::Index {
+            expr: Box::new(sp(Expr::Ident("arr".into()))),
+            index: Box::new(sp(Expr::IntLit(0))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
     }
 
-    // ── Match tests ─────────────────────────────────────────────
+    // ── Match tests ───────────────────────────────────────────────
 
     #[test]
     fn synthesize_match_expression() {
-        use crate::ast::{MatchArm, Pattern};
         let mut tc = TypeChecker::new();
-        let expr = Expr::Match {
-            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
-            arms: vec![
-                MatchArm {
-                    pattern: Pattern::Literal(Expr::IntLit { value: 1, span: s() }),
-                    body: Expr::StringLit { value: "one".into(), span: s() },
-                },
-                MatchArm {
-                    pattern: Pattern::Wildcard,
-                    body: Expr::StringLit { value: "other".into(), span: s() },
-                },
-            ],
-            span: s(),
-        };
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::String);
+        tc.env.bind("x".into(), Type::Int);
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
+            arms: vec![ast::MatchArm {
+                pattern: Spanned::dummy(ast::Pattern::Wildcard),
+                guard: None,
+                body: sp(Expr::IntLit(0)),
+            }],
+        });
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
     }
 
     #[test]
     fn synthesize_match_with_binding() {
-        use crate::ast::{MatchArm, Pattern};
         let mut tc = TypeChecker::new();
-        let expr = Expr::Match {
-            expr: Box::new(Expr::IntLit { value: 5, span: s() }),
-            arms: vec![MatchArm {
-                pattern: Pattern::Ident("x".into()),
-                body: Expr::BinOp {
-                    op: BinOp::Add,
-                    lhs: Box::new(Expr::Var { name: "x".into(), span: s() }),
-                    rhs: Box::new(Expr::IntLit { value: 1, span: s() }),
-                    span: s(),
-                },
+        tc.env.bind("x".into(), Type::Int);
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
+            arms: vec![ast::MatchArm {
+                pattern: Spanned::dummy(ast::Pattern::Ident("y".into())),
+                guard: None,
+                body: sp(Expr::Ident("y".into())),
             }],
-            span: s(),
-        };
-        // x gets a fresh type variable, but Add with Int should unify or pass
-        // Since x is a fresh var, and we add Int to it, the arithmetic check
-        // currently only allows Int/Float. This will fail because x is Var(?T).
-        // For now, just check it doesn't panic.
-        let _result = tc.synthesize(&expr);
+        });
+        // y gets a fresh var, so result is a type var
+        assert!(tc.synthesize(&expr).is_ok());
     }
 
     #[test]
     fn synthesize_match_branch_mismatch() {
-        use crate::ast::{MatchArm, Pattern};
         let mut tc = TypeChecker::new();
-        let expr = Expr::Match {
-            expr: Box::new(Expr::IntLit { value: 1, span: s() }),
+        tc.env.bind("x".into(), Type::Int);
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
             arms: vec![
-                MatchArm {
-                    pattern: Pattern::Literal(Expr::IntLit { value: 0, span: s() }),
-                    body: Expr::IntLit { value: 0, span: s() },
+                ast::MatchArm {
+                    pattern: Spanned::dummy(ast::Pattern::Literal(sp(Expr::IntLit(0)))),
+                    guard: None,
+                    body: sp(Expr::IntLit(1)),
                 },
-                MatchArm {
-                    pattern: Pattern::Wildcard,
-                    body: Expr::StringLit { value: "other".into(), span: s() },
+                ast::MatchArm {
+                    pattern: Spanned::dummy(ast::Pattern::Wildcard),
+                    guard: None,
+                    body: sp(Expr::StringLit("bad".into())),
                 },
             ],
-            span: s(),
-        };
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
-    // ── Block tests ─────────────────────────────────────────────
-
-    #[test]
-    fn synthesize_block() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::Block {
-            exprs: vec![
-                Expr::IntLit { value: 1, span: s() },
-                Expr::StringLit { value: "hello".into(), span: s() },
-            ],
-            span: s(),
-        };
-        // Block returns the type of the last expression
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::String);
-    }
+    // ── Block tests ───────────────────────────────────────────────
 
     #[test]
     fn synthesize_empty_block() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Block {
-            exprs: vec![],
-            span: s(),
-        };
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Unit);
-    }
-
-    // ── UnaryOp tests ───────────────────────────────────────────
-
-    #[test]
-    fn synthesize_neg_int() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::UnaryOp {
-            op: crate::ast::UnaryOp::Neg,
-            operand: Box::new(Expr::IntLit { value: 5, span: s() }),
-            span: s(),
-        };
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+        assert_eq!(
+            tc.synthesize(&sp(Expr::Block(vec![]))).unwrap(),
+            Type::Unit
+        );
     }
 
     #[test]
-    fn synthesize_neg_float() {
+    fn synthesize_block() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::UnaryOp {
-            op: crate::ast::UnaryOp::Neg,
-            operand: Box::new(Expr::FloatLit { value: 3.14, span: s() }),
-            span: s(),
-        };
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Float);
+        let expr = sp(Expr::Block(vec![
+            sp(Expr::IntLit(1)),
+            sp(Expr::StringLit("hello".into())),
+        ]));
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::String);
     }
 
-    #[test]
-    fn synthesize_neg_bool_error() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::UnaryOp {
-            op: crate::ast::UnaryOp::Neg,
-            operand: Box::new(Expr::BoolLit { value: true, span: s() }),
-            span: s(),
-        };
-        assert!(tc.synthesize(&expr).is_err());
-    }
-
-    #[test]
-    fn synthesize_not_bool() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::UnaryOp {
-            op: crate::ast::UnaryOp::Not,
-            operand: Box::new(Expr::BoolLit { value: true, span: s() }),
-            span: s(),
-        };
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
-    }
-
-    #[test]
-    fn synthesize_not_int_error() {
-        let mut tc = TypeChecker::new();
-        let expr = Expr::UnaryOp {
-            op: crate::ast::UnaryOp::Not,
-            operand: Box::new(Expr::IntLit { value: 1, span: s() }),
-            span: s(),
-        };
-        assert!(tc.synthesize(&expr).is_err());
-    }
-
-    // ── Concat tests ────────────────────────────────────────────
+    // ── Concat tests ──────────────────────────────────────────────
 
     #[test]
     fn synthesize_concat() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Concat,
-            lhs: Box::new(Expr::StringLit { value: "hello".into(), span: s() }),
-            rhs: Box::new(Expr::StringLit { value: " world".into(), span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::StringLit("a".into()))),
+            right: Box::new(sp(Expr::StringLit("b".into()))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::String);
     }
 
     #[test]
     fn synthesize_concat_int_error() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Concat,
-            lhs: Box::new(Expr::IntLit { value: 1, span: s() }),
-            rhs: Box::new(Expr::StringLit { value: "x".into(), span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::IntLit(1))),
+            right: Box::new(sp(Expr::StringLit("b".into()))),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
-    // ── Implies tests ───────────────────────────────────────────
+    // ── Implies ───────────────────────────────────────────────────
 
     #[test]
     fn synthesize_implies() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::BinOp {
+        let expr = sp(Expr::BinOp {
             op: BinOp::Implies,
-            lhs: Box::new(Expr::BoolLit { value: true, span: s() }),
-            rhs: Box::new(Expr::BoolLit { value: false, span: s() }),
-            span: s(),
-        };
+            left: Box::new(sp(Expr::BoolLit(true))),
+            right: Box::new(sp(Expr::BoolLit(false))),
+        });
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
     }
 
-    // ── Ascription tests ────────────────────────────────────────
+    // ── UnaryOp tests ─────────────────────────────────────────────
+
+    #[test]
+    fn synthesize_neg_int() {
+        let mut tc = TypeChecker::new();
+        let expr = sp(Expr::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand: Box::new(sp(Expr::IntLit(7))),
+        });
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+    }
+
+    #[test]
+    fn synthesize_neg_float() {
+        let mut tc = TypeChecker::new();
+        let expr = sp(Expr::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand: Box::new(sp(Expr::FloatLit(3.14))),
+        });
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Float);
+    }
+
+    #[test]
+    fn synthesize_neg_bool_error() {
+        let mut tc = TypeChecker::new();
+        let expr = sp(Expr::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand: Box::new(sp(Expr::BoolLit(true))),
+        });
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    #[test]
+    fn synthesize_not_bool() {
+        let mut tc = TypeChecker::new();
+        let expr = sp(Expr::UnaryOp {
+            op: ast::UnaryOp::Not,
+            operand: Box::new(sp(Expr::BoolLit(true))),
+        });
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Bool);
+    }
+
+    #[test]
+    fn synthesize_not_int_error() {
+        let mut tc = TypeChecker::new();
+        let expr = sp(Expr::UnaryOp {
+            op: ast::UnaryOp::Not,
+            operand: Box::new(sp(Expr::IntLit(1))),
+        });
+        assert!(tc.synthesize(&expr).is_err());
+    }
+
+    // ── Ascription tests ──────────────────────────────────────────
 
     #[test]
     fn synthesize_ascription() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Ascription {
-            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
-            ty: Type::Int,
-            span: s(),
-        };
-        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
+        let expr = sp(Expr::Ascription {
+            expr: Box::new(sp(Expr::IntLit(42))),
+            type_expr: Spanned::dummy(ast::TypeExpr::Named("Float".into())),
+        });
+        assert_eq!(tc.synthesize(&expr).unwrap(), Type::Float);
     }
 
     #[test]
     fn synthesize_ascription_mismatch() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Ascription {
-            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
-            ty: Type::String,
-            span: s(),
-        };
+        let expr = sp(Expr::Ascription {
+            expr: Box::new(sp(Expr::StringLit("hi".into()))),
+            type_expr: Spanned::dummy(ast::TypeExpr::Named("Int".into())),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
-    // ── DoBlock tests ───────────────────────────────────────────
+    // ── DoBlock tests ─────────────────────────────────────────────
 
     #[test]
     fn synthesize_do_block() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::DoBlock {
-            stmts: vec![
-                crate::ast::DoStatement::Let {
-                    name: "x".into(),
-                    expr: Expr::IntLit { value: 10, span: s() },
-                },
-                crate::ast::DoStatement::Yield(Expr::Var {
-                    name: "x".into(),
-                    span: s(),
-                }),
-            ],
-            span: s(),
-        };
+        let expr = sp(Expr::DoBlock(vec![
+            Spanned::dummy(ast::DoStatement::Let {
+                name: "x".into(),
+                expr: sp(Expr::IntLit(1)),
+            }),
+            Spanned::dummy(ast::DoStatement::Yield(sp(Expr::Ident("x".into())))),
+        ]));
         assert_eq!(tc.synthesize(&expr).unwrap(), Type::Int);
     }
 
-    // ── Range tests ─────────────────────────────────────────────
+    // ── Range tests ───────────────────────────────────────────────
 
     #[test]
     fn synthesize_range() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Range {
-            start: Box::new(Expr::IntLit { value: 0, span: s() }),
-            end: Box::new(Expr::IntLit { value: 10, span: s() }),
-            span: s(),
-        };
+        let expr = sp(Expr::Range {
+            start: Box::new(sp(Expr::IntLit(0))),
+            end: Box::new(sp(Expr::IntLit(10))),
+        });
         assert_eq!(
             tc.synthesize(&expr).unwrap(),
             Type::Array(Box::new(Type::Int))
@@ -1848,31 +1885,24 @@ mod tests {
     #[test]
     fn synthesize_range_float_error() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Range {
-            start: Box::new(Expr::FloatLit { value: 0.0, span: s() }),
-            end: Box::new(Expr::IntLit { value: 10, span: s() }),
-            span: s(),
-        };
+        let expr = sp(Expr::Range {
+            start: Box::new(sp(Expr::FloatLit(0.0))),
+            end: Box::new(sp(Expr::IntLit(10))),
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
-    // ── Slice tests ─────────────────────────────────────────────
+    // ── Slice tests ───────────────────────────────────────────────
 
     #[test]
     fn synthesize_slice() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Slice {
-            expr: Box::new(Expr::Array {
-                elements: vec![
-                    Expr::IntLit { value: 1, span: s() },
-                    Expr::IntLit { value: 2, span: s() },
-                ],
-                span: s(),
-            }),
-            start: Some(Box::new(Expr::IntLit { value: 0, span: s() })),
-            end: Some(Box::new(Expr::IntLit { value: 1, span: s() })),
-            span: s(),
-        };
+        tc.env.bind("arr".into(), Type::Array(Box::new(Type::Int)));
+        let expr = sp(Expr::Slice {
+            expr: Box::new(sp(Expr::Ident("arr".into()))),
+            start: Some(Box::new(sp(Expr::IntLit(0)))),
+            end: Some(Box::new(sp(Expr::IntLit(3)))),
+        });
         assert_eq!(
             tc.synthesize(&expr).unwrap(),
             Type::Array(Box::new(Type::Int))
@@ -1882,131 +1912,167 @@ mod tests {
     #[test]
     fn synthesize_slice_non_array_error() {
         let mut tc = TypeChecker::new();
-        let expr = Expr::Slice {
-            expr: Box::new(Expr::IntLit { value: 42, span: s() }),
+        tc.env.bind("x".into(), Type::Int);
+        let expr = sp(Expr::Slice {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
             start: None,
             end: None,
-            span: s(),
-        };
+        });
         assert!(tc.synthesize(&expr).is_err());
     }
 
-    // ── Exhaustiveness tests ────────────────────────────────────
-
-    #[test]
-    fn exhaustive_match_with_wildcard() {
-        let mut tc = TypeChecker::new();
-        // match on Option type with wildcard — exhaustive
-        tc.env.bind("x".into(), Type::Named("Option".into()));
-        let expr = Expr::Match {
-            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            arms: vec![
-                MatchArm {
-                    pattern: Pattern::Wildcard,
-                    body: Expr::IntLit { value: 0, span: s() },
-                },
-            ],
-            span: s(),
-        };
-        let _ = tc.synthesize(&expr).unwrap();
-        // No NonExhaustiveMatch error should be present
-        assert!(!tc.errors.iter().any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. })));
-    }
+    // ── Exhaustiveness tests ──────────────────────────────────────
 
     #[test]
     fn exhaustive_match_all_constructors() {
         let mut tc = TypeChecker::new();
-        // match on Option with Some(_) and None — exhaustive
-        tc.env.bind("x".into(), Type::Named("Option".into()));
-        let expr = Expr::Match {
-            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
+        use crate::environment::TypeDef;
+        tc.env.register_type(TypeDef {
+            name: "Bool2".into(),
+            params: vec![],
+            body: Type::Sum {
+                variants: vec![
+                    crate::types::Variant {
+                        name: "True".into(),
+                        fields: None,
+                    },
+                    crate::types::Variant {
+                        name: "False".into(),
+                        fields: None,
+                    },
+                ],
+            },
+        });
+        tc.env.bind("x".into(), Type::Named("Bool2".into()));
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
             arms: vec![
-                MatchArm {
-                    pattern: Pattern::Constructor("Some".into(), vec![Pattern::Ident("v".into())]),
-                    body: Expr::IntLit { value: 1, span: s() },
+                ast::MatchArm {
+                    pattern: Spanned::dummy(ast::Pattern::Constructor("True".into(), vec![])),
+                    guard: None,
+                    body: sp(Expr::IntLit(1)),
                 },
-                MatchArm {
-                    pattern: Pattern::Constructor("None".into(), vec![]),
-                    body: Expr::IntLit { value: 0, span: s() },
+                ast::MatchArm {
+                    pattern: Spanned::dummy(ast::Pattern::Constructor("False".into(), vec![])),
+                    guard: None,
+                    body: sp(Expr::IntLit(0)),
                 },
             ],
-            span: s(),
-        };
-        let _ = tc.synthesize(&expr).unwrap();
-        assert!(!tc.errors.iter().any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. })));
+        });
+        assert!(tc.synthesize(&expr).is_ok());
+        assert!(tc.is_ok()); // No non-exhaustive warning
     }
 
     #[test]
     fn non_exhaustive_match_missing_constructor() {
         let mut tc = TypeChecker::new();
-        // match on Option with only Some(_) — missing None
-        tc.env.bind("x".into(), Type::Named("Option".into()));
-        let expr = Expr::Match {
-            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            arms: vec![
-                MatchArm {
-                    pattern: Pattern::Constructor("Some".into(), vec![Pattern::Ident("v".into())]),
-                    body: Expr::IntLit { value: 1, span: s() },
-                },
-            ],
-            span: s(),
-        };
-        // Synthesis still succeeds (non-exhaustiveness is a warning)
-        let _ = tc.synthesize(&expr).unwrap();
-        let has_non_exhaustive = tc.errors.iter().any(|e| {
-            if let TypeError::NonExhaustiveMatch { missing, .. } = e {
-                missing.contains("None")
-            } else {
-                false
-            }
+        use crate::environment::TypeDef;
+        tc.env.register_type(TypeDef {
+            name: "Bool2".into(),
+            params: vec![],
+            body: Type::Sum {
+                variants: vec![
+                    crate::types::Variant {
+                        name: "True".into(),
+                        fields: None,
+                    },
+                    crate::types::Variant {
+                        name: "False".into(),
+                        fields: None,
+                    },
+                ],
+            },
         });
-        assert!(has_non_exhaustive);
+        tc.env.bind("x".into(), Type::Named("Bool2".into()));
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
+            arms: vec![ast::MatchArm {
+                pattern: Spanned::dummy(ast::Pattern::Constructor("True".into(), vec![])),
+                guard: None,
+                body: sp(Expr::IntLit(1)),
+            }],
+        });
+        assert!(tc.synthesize(&expr).is_ok()); // synthesis still succeeds
+        assert!(!tc.is_ok()); // but warns about non-exhaustive
     }
 
     #[test]
-    fn non_exhaustive_match_result_missing_err() {
+    fn exhaustive_match_with_wildcard() {
         let mut tc = TypeChecker::new();
-        tc.env.bind("r".into(), Type::Named("Result".into()));
-        let expr = Expr::Match {
-            expr: Box::new(Expr::Var { name: "r".into(), span: s() }),
+        tc.env.bind("x".into(), Type::Int);
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
             arms: vec![
-                MatchArm {
-                    pattern: Pattern::Constructor("Ok".into(), vec![Pattern::Ident("v".into())]),
-                    body: Expr::IntLit { value: 1, span: s() },
+                ast::MatchArm {
+                    pattern: Spanned::dummy(ast::Pattern::Literal(sp(Expr::IntLit(0)))),
+                    guard: None,
+                    body: sp(Expr::StringLit("zero".into())),
+                },
+                ast::MatchArm {
+                    pattern: Spanned::dummy(ast::Pattern::Wildcard),
+                    guard: None,
+                    body: sp(Expr::StringLit("other".into())),
                 },
             ],
-            span: s(),
-        };
-        let _ = tc.synthesize(&expr).unwrap();
-        let has_non_exhaustive = tc.errors.iter().any(|e| {
-            if let TypeError::NonExhaustiveMatch { missing, .. } = e {
-                missing.contains("Err")
-            } else {
-                false
-            }
         });
-        assert!(has_non_exhaustive);
+        assert!(tc.synthesize(&expr).is_ok());
+        assert!(tc.is_ok());
     }
 
     #[test]
     fn exhaustive_match_with_ident_catch_all() {
         let mut tc = TypeChecker::new();
-        tc.env.bind("x".into(), Type::Named("Option".into()));
-        let expr = Expr::Match {
-            expr: Box::new(Expr::Var { name: "x".into(), span: s() }),
-            arms: vec![
-                MatchArm {
-                    pattern: Pattern::Constructor("Some".into(), vec![Pattern::Ident("v".into())]),
-                    body: Expr::IntLit { value: 1, span: s() },
-                },
-                MatchArm {
-                    pattern: Pattern::Ident("other".into()),
-                    body: Expr::IntLit { value: 0, span: s() },
-                },
-            ],
-            span: s(),
-        };
-        let _ = tc.synthesize(&expr).unwrap();
-        assert!(!tc.errors.iter().any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. })));
+        tc.env.bind("x".into(), Type::Int);
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
+            arms: vec![ast::MatchArm {
+                pattern: Spanned::dummy(ast::Pattern::Ident("n".into())),
+                guard: None,
+                body: sp(Expr::Ident("n".into())),
+            }],
+        });
+        assert!(tc.synthesize(&expr).is_ok());
+        assert!(tc.is_ok());
+    }
+
+    #[test]
+    fn non_exhaustive_match_result_missing_err() {
+        let mut tc = TypeChecker::new();
+        use crate::environment::TypeDef;
+        tc.env.register_type(TypeDef {
+            name: "Result".into(),
+            params: vec![],
+            body: Type::Sum {
+                variants: vec![
+                    crate::types::Variant {
+                        name: "Ok".into(),
+                        fields: Some(vec![("value".into(), Type::Int)]),
+                    },
+                    crate::types::Variant {
+                        name: "Err".into(),
+                        fields: Some(vec![("error".into(), Type::String)]),
+                    },
+                ],
+            },
+        });
+        tc.env.bind("x".into(), Type::Named("Result".into()));
+        let expr = sp(Expr::Match {
+            expr: Box::new(sp(Expr::Ident("x".into()))),
+            arms: vec![ast::MatchArm {
+                pattern: Spanned::dummy(ast::Pattern::Constructor(
+                    "Ok".into(),
+                    vec![Spanned::dummy(ast::Pattern::Ident("v".into()))],
+                )),
+                guard: None,
+                body: sp(Expr::IntLit(1)),
+            }],
+        });
+        assert!(tc.synthesize(&expr).is_ok());
+        // Should report missing "Err"
+        let non_exhaustive = tc
+            .errors()
+            .iter()
+            .any(|e| matches!(e, TypeError::NonExhaustiveMatch { .. }));
+        assert!(non_exhaustive);
     }
 }

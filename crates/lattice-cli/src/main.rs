@@ -227,40 +227,37 @@ fn cmd_check(file: &PathBuf, verbose: bool) -> Result<(), String> {
     for item in &program {
         match &item.node {
             lattice_parser::ast::Item::LetBinding(lb) => {
-                if let Some(tc_expr) =
-                    lattice_repl::convert_expr_for_types(&lb.value.node)
-                {
-                    match tc.synthesize(&tc_expr) {
-                        Ok(ty) => {
-                            tc.env.bind(lb.name.clone(), ty.clone());
-                            type_checked += 1;
-                            if verbose {
-                                eprintln!(
-                                    "  {} let {}: {}",
-                                    "✓".green(),
-                                    lb.name,
-                                    ty
-                                );
-                            }
+                match tc.synthesize(&lb.value) {
+                    Ok(ty) => {
+                        tc.env.bind(lb.name.clone(), ty.clone());
+                        type_checked += 1;
+                        if verbose {
+                            eprintln!(
+                                "  {} let {}: {}",
+                                "✓".green(),
+                                lb.name,
+                                ty
+                            );
                         }
-                        Err(e) => {
-                            type_errors += 1;
-                            eprintln!("  {} {}", "✗".red().bold(), e);
-                        }
+                    }
+                    Err(e) => {
+                        type_errors += 1;
+                        eprintln!("  {} {}", "✗".red().bold(), e);
                     }
                 }
             }
             lattice_parser::ast::Item::Function(f) => {
                 // Register function type in environment for mutual references
+                use lattice_types::checker::convert_type_expr;
                 let param_types: Vec<lattice_types::types::Type> = f
                     .params
                     .iter()
-                    .map(|p| lattice_repl::convert_type_expr_for_types(&p.type_expr.node))
+                    .map(|p| convert_type_expr(&p.type_expr.node))
                     .collect();
                 let ret_type = f
                     .return_type
                     .as_ref()
-                    .map(|t| lattice_repl::convert_type_expr_for_types(&t.node))
+                    .map(|t| convert_type_expr(&t.node))
                     .unwrap_or(lattice_types::types::Type::Unit);
                 tc.env.bind(
                     f.name.clone(),

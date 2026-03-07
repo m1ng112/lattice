@@ -88,43 +88,37 @@ impl LatticeBackend {
                 for item in &program {
                     match &item.node {
                         Item::LetBinding(lb) => {
-                            if let Some(tc_expr) =
-                                lattice_repl::convert_expr_for_types(&lb.value.node)
-                            {
-                                match tc.synthesize(&tc_expr) {
-                                    Ok(ty) => {
-                                        tc.env.bind(lb.name.clone(), ty);
-                                    }
-                                    Err(e) => {
-                                        let span = tc_expr.span();
-                                        let range = Range::new(
-                                            index.offset_to_position(span.start),
-                                            index.offset_to_position(span.end),
-                                        );
-                                        diagnostics.push(Diagnostic {
-                                            range,
-                                            severity: Some(DiagnosticSeverity::ERROR),
-                                            source: Some("lattice-types".into()),
-                                            message: e.to_string(),
-                                            ..Default::default()
-                                        });
-                                    }
+                            match tc.synthesize(&lb.value) {
+                                Ok(ty) => {
+                                    tc.env.bind(lb.name.clone(), ty);
+                                }
+                                Err(e) => {
+                                    let range = Range::new(
+                                        index.offset_to_position(lb.value.span.start),
+                                        index.offset_to_position(lb.value.span.end),
+                                    );
+                                    diagnostics.push(Diagnostic {
+                                        range,
+                                        severity: Some(DiagnosticSeverity::ERROR),
+                                        source: Some("lattice-types".into()),
+                                        message: e.to_string(),
+                                        ..Default::default()
+                                    });
                                 }
                             }
                         }
                         Item::Function(f) => {
                             // Register function type in TC environment
+                            use lattice_types::checker::convert_type_expr;
                             let param_types: Vec<lattice_types::types::Type> = f
                                 .params
                                 .iter()
-                                .map(|p| {
-                                    lattice_repl::convert_type_expr_for_types(&p.type_expr.node)
-                                })
+                                .map(|p| convert_type_expr(&p.type_expr.node))
                                 .collect();
                             let ret_type = f
                                 .return_type
                                 .as_ref()
-                                .map(|t| lattice_repl::convert_type_expr_for_types(&t.node))
+                                .map(|t| convert_type_expr(&t.node))
                                 .unwrap_or(lattice_types::types::Type::Unit);
                             let fn_type = lattice_types::types::Type::Function {
                                 params: param_types,
@@ -310,9 +304,8 @@ impl LanguageServer for LatticeBackend {
                         .map(|t| format!(": {}", type_expr_to_string(&t.node)))
                         .or_else(|| {
                             // Try to infer the type via the type checker
-                            let tc_expr = lattice_repl::convert_expr_for_types(&lb.value.node)?;
                             let mut tc = TypeChecker::new();
-                            let inferred = tc.synthesize(&tc_expr).ok()?;
+                            let inferred = tc.synthesize(&lb.value).ok()?;
                             Some(format!(": {}", inferred))
                         })
                         .unwrap_or_default();
@@ -812,10 +805,8 @@ let result = add(1, 2)
             _ => panic!("expected let binding"),
         };
 
-        // Simulate what hover does: try to infer type
-        let tc_expr = lattice_repl::convert_expr_for_types(&lb.value.node).unwrap();
         let mut tc = TypeChecker::new();
-        let inferred = tc.synthesize(&tc_expr).unwrap();
+        let inferred = tc.synthesize(&lb.value).unwrap();
         assert_eq!(format!("{}", inferred), "Int");
     }
 
@@ -828,9 +819,8 @@ let result = add(1, 2)
             _ => panic!("expected let binding"),
         };
 
-        let tc_expr = lattice_repl::convert_expr_for_types(&lb.value.node).unwrap();
         let mut tc = TypeChecker::new();
-        let inferred = tc.synthesize(&tc_expr).unwrap();
+        let inferred = tc.synthesize(&lb.value).unwrap();
         assert_eq!(format!("{}", inferred), "String");
     }
 
@@ -843,9 +833,8 @@ let result = add(1, 2)
             _ => panic!("expected let binding"),
         };
 
-        let tc_expr = lattice_repl::convert_expr_for_types(&lb.value.node).unwrap();
         let mut tc = TypeChecker::new();
-        let inferred = tc.synthesize(&tc_expr).unwrap();
+        let inferred = tc.synthesize(&lb.value).unwrap();
         assert_eq!(format!("{}", inferred), "[Int]");
     }
 

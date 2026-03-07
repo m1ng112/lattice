@@ -192,13 +192,13 @@ impl Repl {
 
     fn cmd_type(&mut self, input: &str) -> ReplResult {
         match parser::parse_expression(input) {
-            Ok(expr) => match convert_expr_for_types(&expr) {
-                Some(tc_expr) => match self.type_checker.synthesize(&tc_expr) {
+            Ok(expr) => {
+                let spanned = ast::Spanned::dummy(expr);
+                match self.type_checker.synthesize(&spanned) {
                     Ok(ty) => ReplResult::TypeInfo(ty.to_string()),
                     Err(e) => ReplResult::Error(format!("Type error: {e}")),
-                },
-                None => ReplResult::Error("Expression not supported for type inference".into()),
-            },
+                }
+            }
             Err(errors) => ReplResult::Error(format_parse_errors(&errors)),
         }
     }
@@ -366,7 +366,9 @@ fn is_balanced(input: &str) -> bool {
 }
 
 /// Convert a parser AST expression to the type checker's AST expression.
-pub fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Expr> {
+/// DEPRECATED: The type checker now operates on parser AST directly.
+#[allow(dead_code)]
+fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Expr> {
     use lattice_types::ast as tc;
     let span = tc::Span::dummy();
     match expr {
@@ -619,7 +621,8 @@ pub fn convert_expr_for_types(expr: &ast::Expr) -> Option<lattice_types::ast::Ex
     }
 }
 
-pub fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types::ast::Pattern> {
+#[allow(dead_code)]
+fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types::ast::Pattern> {
     use lattice_types::ast::Pattern as TcP;
     match pattern {
         ast::Pattern::Wildcard => Some(TcP::Wildcard),
@@ -639,7 +642,8 @@ pub fn convert_pattern_for_types(pattern: &ast::Pattern) -> Option<lattice_types
     }
 }
 
-pub fn convert_type_expr_for_types(type_expr: &ast::TypeExpr) -> lattice_types::types::Type {
+#[allow(dead_code)]
+fn convert_type_expr_for_types(type_expr: &ast::TypeExpr) -> lattice_types::types::Type {
     match type_expr {
         ast::TypeExpr::Named(name) => match name.as_str() {
             "Int" => lattice_types::types::Type::Int,

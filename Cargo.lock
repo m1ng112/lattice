@@ -1125,7 +1125,6 @@ version = "0.1.0"
 dependencies = [
  "lattice-parser",
  "lattice-proof",
- "lattice-repl",
  "lattice-types",
  "serde",
  "serde_json",
@@ -1198,6 +1197,7 @@ dependencies = [
 name = "lattice-types"
 version = "0.1.0"
 dependencies = [
+ "lattice-parser",
  "serde",
  "thiserror",
 ]
