@@ -290,6 +290,59 @@ impl Compiler {
                 self.compile_do_block(statements, instructions)?;
             }
 
+            // Relational algebra: compile as builtin function calls
+            ast::Expr::Select {
+                predicate,
+                relation,
+            } => {
+                // __rel_select__(relation, predicate_closure)
+                self.compile_expr(&relation.node, instructions)?;
+                self.compile_lambda_from_predicate(predicate, instructions)?;
+                instructions.push(Instruction::Call("__rel_select__".into(), 2));
+            }
+
+            ast::Expr::Project { fields, relation } => {
+                // __rel_project__(relation, fields_array)
+                self.compile_expr(&relation.node, instructions)?;
+                for field in fields {
+                    instructions.push(Instruction::PushString(field.clone()));
+                }
+                instructions.push(Instruction::MakeArray(fields.len()));
+                instructions.push(Instruction::Call("__rel_project__".into(), 2));
+            }
+
+            ast::Expr::Join {
+                left,
+                condition,
+                right,
+            } => {
+                // __rel_join__(left, right, condition_closure)
+                self.compile_expr(&left.node, instructions)?;
+                self.compile_expr(&right.node, instructions)?;
+                self.compile_lambda_from_predicate(condition, instructions)?;
+                instructions.push(Instruction::Call("__rel_join__".into(), 3));
+            }
+
+            ast::Expr::GroupBy {
+                keys,
+                aggregates,
+                relation,
+            } => {
+                // __rel_group_by__(relation, keys_array, agg_closure)
+                self.compile_expr(&relation.node, instructions)?;
+                for key in keys {
+                    instructions.push(Instruction::PushString(key.clone()));
+                }
+                instructions.push(Instruction::MakeArray(keys.len()));
+                // Compile aggregates as a lambda that receives the group
+                if let Some(agg) = aggregates.first() {
+                    self.compile_lambda_from_predicate(agg, instructions)?;
+                } else {
+                    instructions.push(Instruction::PushNull);
+                }
+                instructions.push(Instruction::Call("__rel_group_by__".into(), 3));
+            }
+
             _ => {
                 return Err(CodegenError::Unsupported(format!("{expr:?}")));
             }
@@ -531,6 +584,36 @@ impl Compiler {
         instructions.push(Instruction::MakeClosure(func_idx, captured));
         Ok(())
     }
+
+    /// Compile an expression as a single-argument lambda (for relational predicates).
+    /// The expression is wrapped as `fn(row) -> expr`.
+    fn compile_lambda_from_predicate(
+        &mut self,
+        expr: &Spanned<ast::Expr>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), CodegenError> {
+        let mut body_instructions = Vec::new();
+        self.compile_expr(&expr.node, &mut body_instructions)?;
+        body_instructions.push(Instruction::Return);
+
+        let param_names = vec!["row".to_string()];
+
+        let mut free_vars = std::collections::HashSet::new();
+        let mut bound_vars: std::collections::HashSet<String> =
+            param_names.iter().cloned().collect();
+        collect_free_vars(&expr.node, &mut free_vars, &mut bound_vars);
+        let captured: Vec<String> = free_vars.into_iter().collect();
+
+        let func_idx = self.functions.len();
+        self.functions.push(Function {
+            name: format!("__lambda_{func_idx}__"),
+            params: param_names,
+            instructions: body_instructions,
+        });
+
+        instructions.push(Instruction::MakeClosure(func_idx, captured));
+        Ok(())
+    }
 }
 
 /// Collect free variables in an expression (variables not bound by local scope).
@@ -669,9 +752,26 @@ fn collect_free_vars(
                 }
             }
         }
+        ast::Expr::Select { predicate, relation } => {
+            collect_free_vars(&predicate.node, free, bound);
+            collect_free_vars(&relation.node, free, bound);
+        }
+        ast::Expr::Project { relation, .. } => {
+            collect_free_vars(&relation.node, free, bound);
+        }
+        ast::Expr::Join { left, condition, right } => {
+            collect_free_vars(&left.node, free, bound);
+            collect_free_vars(&condition.node, free, bound);
+            collect_free_vars(&right.node, free, bound);
+        }
+        ast::Expr::GroupBy { aggregates, relation, .. } => {
+            collect_free_vars(&relation.node, free, bound);
+            for agg in aggregates {
+                collect_free_vars(&agg.node, free, bound);
+            }
+        }
         _ => {
-            // Select, Project, Join, GroupBy, ForAll, Exists, Branch, Synthesize
-            // These are less common; skip for now
+            // ForAll, Exists, Branch, Synthesize — skip
         }
     }
 }

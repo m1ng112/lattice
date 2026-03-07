@@ -290,6 +290,128 @@ impl Interpreter {
                 }
                 Ok(Some(Value::Bool(true)))
             }
+            // Relational algebra builtins
+            "__rel_select__" => {
+                // __rel_select__(relation, predicate_closure)
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("select requires 2 arguments".into()));
+                }
+                let rows = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("select: first argument must be array of records".into())),
+                };
+                let closure = args[1].clone();
+                let mut result = Vec::new();
+                for row in rows {
+                    let keep = self.call_closure_value(closure.clone(), vec![row.clone()], program)?;
+                    if matches!(keep, Value::Bool(true)) {
+                        result.push(row);
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "__rel_project__" => {
+                // __rel_project__(relation, fields_array)
+                if args.len() != 2 {
+                    return Err(CodegenError::TypeError("project requires 2 arguments".into()));
+                }
+                let rows = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("project: first argument must be array of records".into())),
+                };
+                let fields = match &args[1] {
+                    Value::Array(a) => a.iter().filter_map(|v| {
+                        if let Value::String(s) = v { Some(s.clone()) } else { None }
+                    }).collect::<Vec<_>>(),
+                    _ => return Err(CodegenError::TypeError("project: second argument must be array of field names".into())),
+                };
+                let result: Vec<Value> = rows.into_iter().map(|row| {
+                    if let Value::Object(obj) = row {
+                        let projected: HashMap<String, Value> = fields.iter()
+                            .filter_map(|f| obj.get(f).map(|v| (f.clone(), v.clone())))
+                            .collect();
+                        Value::Object(projected)
+                    } else {
+                        row
+                    }
+                }).collect();
+                Ok(Some(Value::Array(result)))
+            }
+            "__rel_join__" => {
+                // __rel_join__(left, right, condition_closure)
+                if args.len() != 3 {
+                    return Err(CodegenError::TypeError("join requires 3 arguments".into()));
+                }
+                let left_rows = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("join: first argument must be array".into())),
+                };
+                let right_rows = match &args[1] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("join: second argument must be array".into())),
+                };
+                let closure = args[2].clone();
+                let mut result = Vec::new();
+                for l in &left_rows {
+                    for r in &right_rows {
+                        // Merge left and right records
+                        let merged = match (l, r) {
+                            (Value::Object(lo), Value::Object(ro)) => {
+                                let mut m = lo.clone();
+                                m.extend(ro.iter().map(|(k, v)| (k.clone(), v.clone())));
+                                Value::Object(m)
+                            }
+                            _ => Value::Array(vec![l.clone(), r.clone()]),
+                        };
+                        let keep = self.call_closure_value(closure.clone(), vec![merged.clone()], program)?;
+                        if matches!(keep, Value::Bool(true)) {
+                            result.push(merged);
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "__rel_group_by__" => {
+                // __rel_group_by__(relation, keys_array, agg_closure)
+                if args.len() != 3 {
+                    return Err(CodegenError::TypeError("group_by requires 3 arguments".into()));
+                }
+                let rows = match &args[0] {
+                    Value::Array(a) => a.clone(),
+                    _ => return Err(CodegenError::TypeError("group_by: first argument must be array".into())),
+                };
+                let keys = match &args[1] {
+                    Value::Array(a) => a.iter().filter_map(|v| {
+                        if let Value::String(s) = v { Some(s.clone()) } else { None }
+                    }).collect::<Vec<_>>(),
+                    _ => return Err(CodegenError::TypeError("group_by: second argument must be array of key names".into())),
+                };
+                // Group rows by key values
+                let mut groups: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+                for row in &rows {
+                    let key_vals: Vec<String> = keys.iter().map(|k| {
+                        if let Value::Object(obj) = row {
+                            obj.get(k).map(|v| format!("{v:?}")).unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    }).collect();
+                    let group_key = key_vals.join("|");
+                    groups.entry(group_key).or_default().push(row.clone());
+                }
+                // Apply aggregate closure to each group, or return groups as arrays
+                let closure = args[2].clone();
+                let mut result = Vec::new();
+                for (_key, group) in groups {
+                    if matches!(closure, Value::Null) {
+                        result.push(Value::Array(group));
+                    } else {
+                        let val = self.call_closure_value(closure.clone(), vec![Value::Array(group)], program)?;
+                        result.push(val);
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
             _ => Ok(None),
         }
     }
@@ -2017,5 +2139,160 @@ mod tests {
         };
         let mut interp = Interpreter::new();
         assert_eq!(interp.execute(&program).unwrap(), Value::Bool(false));
+    }
+
+    // ── Relational algebra ──────────────────────────
+
+    /// Helper: make a record expression { k1: v1, k2: v2, ... }
+    fn record(fields: Vec<(&str, Expr)>) -> Expr {
+        Expr::Record(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), s(v)))
+                .collect(),
+        )
+    }
+
+    /// Helper: make a table (array of records)
+    fn table(rows: Vec<Expr>) -> Expr {
+        Expr::Array(rows.into_iter().map(|r| s(r)).collect())
+    }
+
+    /// Helper: field access `row.field`
+    fn row_field(field: &str) -> Expr {
+        Expr::Field {
+            expr: Box::new(s(Expr::Ident("row".into()))),
+            name: field.to_string(),
+        }
+    }
+
+    #[test]
+    fn rel_select_filters_rows() {
+        // SELECT * FROM people WHERE age > 25
+        let people = table(vec![
+            record(vec![("name", Expr::StringLit("Alice".into())), ("age", Expr::IntLit(30))]),
+            record(vec![("name", Expr::StringLit("Bob".into())), ("age", Expr::IntLit(20))]),
+            record(vec![("name", Expr::StringLit("Carol".into())), ("age", Expr::IntLit(35))]),
+        ]);
+        let predicate = binop(int(25), BinOp::Lt, s(row_field("age")));
+        let expr = Expr::Select {
+            relation: Box::new(s(people)),
+            predicate: Box::new(s(predicate)),
+        };
+        let result = eval_expr(&expr).unwrap();
+        if let Value::Array(rows) = result {
+            assert_eq!(rows.len(), 2); // Alice(30) and Carol(35)
+        } else {
+            panic!("expected array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn rel_project_selects_fields() {
+        // SELECT name FROM people
+        let people = table(vec![
+            record(vec![("name", Expr::StringLit("Alice".into())), ("age", Expr::IntLit(30))]),
+            record(vec![("name", Expr::StringLit("Bob".into())), ("age", Expr::IntLit(20))]),
+        ]);
+        let expr = Expr::Project {
+            relation: Box::new(s(people)),
+            fields: vec!["name".to_string()],
+        };
+        let result = eval_expr(&expr).unwrap();
+        if let Value::Array(rows) = result {
+            assert_eq!(rows.len(), 2);
+            // Each row should only have "name" field
+            for row in &rows {
+                if let Value::Object(obj) = row {
+                    assert_eq!(obj.len(), 1);
+                    assert!(obj.contains_key("name"));
+                } else {
+                    panic!("expected object, got {row:?}");
+                }
+            }
+        } else {
+            panic!("expected array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn rel_join_cross_product_with_filter() {
+        // JOIN people, departments ON row.dept == row.dept_name
+        let people = table(vec![
+            record(vec![("name", Expr::StringLit("Alice".into())), ("dept", Expr::StringLit("eng".into()))]),
+            record(vec![("name", Expr::StringLit("Bob".into())), ("dept", Expr::StringLit("sales".into()))]),
+        ]);
+        let departments = table(vec![
+            record(vec![("dept_name", Expr::StringLit("eng".into())), ("floor", Expr::IntLit(3))]),
+            record(vec![("dept_name", Expr::StringLit("sales".into())), ("floor", Expr::IntLit(1))]),
+        ]);
+        let condition = binop(
+            s(row_field("dept")),
+            BinOp::Eq,
+            s(row_field("dept_name")),
+        );
+        let expr = Expr::Join {
+            left: Box::new(s(people)),
+            right: Box::new(s(departments)),
+            condition: Box::new(s(condition)),
+        };
+        let result = eval_expr(&expr).unwrap();
+        if let Value::Array(rows) = result {
+            assert_eq!(rows.len(), 2); // Alice-eng, Bob-sales
+            // Each merged row has all 3 fields: name, dept, dept_name, floor
+            for row in &rows {
+                if let Value::Object(obj) = row {
+                    assert!(obj.contains_key("name"));
+                    assert!(obj.contains_key("floor"));
+                } else {
+                    panic!("expected object, got {row:?}");
+                }
+            }
+        } else {
+            panic!("expected array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn rel_group_by_without_aggregate() {
+        // GROUP BY dept (no aggregate → returns grouped arrays)
+        let people = table(vec![
+            record(vec![("name", Expr::StringLit("Alice".into())), ("dept", Expr::StringLit("eng".into()))]),
+            record(vec![("name", Expr::StringLit("Bob".into())), ("dept", Expr::StringLit("eng".into()))]),
+            record(vec![("name", Expr::StringLit("Carol".into())), ("dept", Expr::StringLit("sales".into()))]),
+        ]);
+        let expr = Expr::GroupBy {
+            relation: Box::new(s(people)),
+            keys: vec!["dept".to_string()],
+            aggregates: vec![],
+        };
+        let result = eval_expr(&expr).unwrap();
+        if let Value::Array(groups) = result {
+            assert_eq!(groups.len(), 2); // eng group, sales group
+            // One group has 2 items, the other has 1
+            let mut sizes: Vec<usize> = groups.iter().map(|g| {
+                if let Value::Array(a) = g { a.len() } else { 0 }
+            }).collect();
+            sizes.sort();
+            assert_eq!(sizes, vec![1, 2]);
+        } else {
+            panic!("expected array, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn rel_select_empty_result() {
+        // SELECT * FROM people WHERE age > 100 → empty
+        let people = table(vec![
+            record(vec![("age", Expr::IntLit(30))]),
+            record(vec![("age", Expr::IntLit(20))]),
+        ]);
+        let predicate = binop(int(100), BinOp::Lt, s(row_field("age")));
+        let expr = Expr::Select {
+            relation: Box::new(s(people)),
+            predicate: Box::new(s(predicate)),
+        };
+        let result = eval_expr(&expr).unwrap();
+        assert_eq!(result, Value::Array(vec![]));
     }
 }
