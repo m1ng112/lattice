@@ -60,6 +60,7 @@ pub enum Item {
     Module(Module),
     Model(Model),
     Meta(Meta),
+    Import(Import),
 }
 
 // ── Graph ──────────────────────────────────
@@ -495,6 +496,23 @@ pub struct LetBinding {
 pub struct Module {
     pub name: String,
     pub items: Vec<Spanned<Item>>,
+}
+
+// ── Import ─────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Import {
+    /// Dotted module path, e.g. `["std", "math"]`.
+    pub path: Vec<String>,
+    /// Selective imports. `None` means import all (`import std.math`),
+    /// `Some(names)` means selective (`import std.math.{sin, cos}`).
+    pub names: Option<Vec<ImportName>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportName {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 // ── Probabilistic Model ────────────────────

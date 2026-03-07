@@ -60,6 +60,7 @@ impl Printer {
             Item::Model(m) => self.print_model(m),
             Item::Meta(m) => self.print_meta(m),
             Item::LetBinding(lb) => self.print_let_binding(lb),
+            Item::Import(imp) => self.print_import(imp),
         }
     }
 
@@ -340,6 +341,26 @@ impl Printer {
         }
         self.indent -= 1;
         self.writeln("}");
+    }
+
+    fn print_import(&mut self, imp: &Import) {
+        self.write_indent();
+        self.write("import ");
+        self.write(&imp.path.join("."));
+        if let Some(names) = &imp.names {
+            self.write(".{");
+            for (i, n) in names.iter().enumerate() {
+                if i > 0 {
+                    self.write(", ");
+                }
+                self.write(&n.name);
+                if let Some(alias) = &n.alias {
+                    self.write(&format!(" as {}", alias));
+                }
+            }
+            self.write("}");
+        }
+        self.newline();
     }
 
     fn print_let_binding(&mut self, lb: &LetBinding) {

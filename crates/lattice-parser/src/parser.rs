@@ -81,6 +81,7 @@ enum Token {
     Type,
     Let,
     Module,
+    Import,
     Model,
     Meta,
     Pre,
@@ -596,6 +597,7 @@ impl Lexer {
             "type" => Token::Type,
             "let" => Token::Let,
             "module" => Token::Module,
+            "import" => Token::Import,
             "model" => Token::Model,
             "meta" => Token::Meta,
             "pre" => Token::Pre,
@@ -745,6 +747,7 @@ impl Parser {
             Token::Type => "type",
             Token::Let => "let",
             Token::Module => "module",
+            Token::Import => "import",
             Token::Model => "model",
             Token::Meta => "meta",
             Token::Do => "do",
@@ -840,6 +843,7 @@ impl Parser {
             Token::Type => Some(Item::TypeDef(self.parse_type_def())),
             Token::Let => Some(Item::LetBinding(self.parse_let_binding())),
             Token::Module => Some(Item::Module(self.parse_module())),
+            Token::Import => Some(Item::Import(self.parse_import())),
             Token::Model => Some(Item::Model(self.parse_model())),
             Token::Meta => Some(Item::Meta(self.parse_meta())),
             Token::At => {
@@ -853,7 +857,7 @@ impl Parser {
             }
             _ => {
                 self.error(format!(
-                    "expected top-level item (graph, function, type, let, module, model, meta), found {:?}",
+                    "expected top-level item (graph, function, type, let, module, import, model, meta), found {:?}",
                     self.peek_token()
                 ));
                 None
@@ -1716,6 +1720,48 @@ impl Parser {
         self.eat(&Token::RBrace);
 
         Module { name, items }
+    }
+
+    // ── Import ──────────────────────────────
+
+    fn parse_import(&mut self) -> Import {
+        self.advance(); // consume 'import'
+
+        // Parse dotted path: `std.math.trig`
+        let mut path = vec![self.expect_ident()];
+        while self.eat(&Token::Dot) {
+            // Check for selective import: `std.math.{sin, cos}`
+            if *self.peek_token() == Token::LBrace {
+                break;
+            }
+            path.push(self.expect_ident());
+        }
+
+        // Parse optional selective imports: `.{name1, name2 as alias}`
+        let names = if self.eat(&Token::LBrace) {
+            let mut names = Vec::new();
+            loop {
+                if *self.peek_token() == Token::RBrace || *self.peek_token() == Token::Eof {
+                    break;
+                }
+                let name = self.expect_ident();
+                let alias = if self.eat(&Token::As) {
+                    Some(self.expect_ident())
+                } else {
+                    None
+                };
+                names.push(ImportName { name, alias });
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::RBrace);
+            Some(names)
+        } else {
+            None
+        };
+
+        Import { path, names }
     }
 
     // ── Model ───────────────────────────────

@@ -314,6 +314,15 @@ impl LanguageServer for LatticeBackend {
                 Item::Model(m) => format!("**model** {}", m.name),
                 Item::Module(m) => format!("**module** {} ({} items)", m.name, m.items.len()),
                 Item::Meta(m) => format!("**meta** {}", m.name),
+                Item::Import(imp) => {
+                    let path = imp.path.join(".");
+                    if let Some(names) = &imp.names {
+                        let ns: Vec<&str> = names.iter().map(|n| n.name.as_str()).collect();
+                        format!("**import** {}.{{{}}}", path, ns.join(", "))
+                    } else {
+                        format!("**import** {}", path)
+                    }
+                }
             };
 
             return Ok(Some(Hover {
@@ -433,6 +442,10 @@ impl LanguageServer for LatticeBackend {
                 Item::Meta(m) => {
                     symbols.push(symbol_info(&m.name, SymbolKind::PROPERTY, range, uri));
                 }
+                Item::Import(imp) => {
+                    let label = imp.path.join(".");
+                    symbols.push(symbol_info(&label, SymbolKind::NAMESPACE, range, uri));
+                }
             }
         }
 
@@ -480,6 +493,7 @@ impl LanguageServer for LatticeBackend {
                 Item::Module(m) => &m.name,
                 Item::Model(m) => &m.name,
                 Item::Meta(m) => &m.name,
+                Item::Import(_) => continue,
             };
             if name == &ident {
                 let range = index.span_to_range(&item.span);

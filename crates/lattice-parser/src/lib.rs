@@ -3,6 +3,7 @@ pub mod diagnostic;
 pub mod lexer;
 pub mod parser;
 pub mod printer;
+pub mod resolver;
 
 #[cfg(test)]
 mod tests {
@@ -390,5 +391,92 @@ let f = fn(x: Int) -> x + 1
             }
             _ => panic!("expected let binding"),
         }
+    }
+
+    #[test]
+    fn parse_import_whole_module() {
+        let source = "import math\n";
+        let program = parser::parse(source).expect("parse failed");
+        assert_eq!(program.len(), 1);
+        match &program[0].node {
+            ast::Item::Import(imp) => {
+                assert_eq!(imp.path, vec!["math"]);
+                assert!(imp.names.is_none());
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn parse_import_dotted_path() {
+        let source = "import std.math.trig\n";
+        let program = parser::parse(source).expect("parse failed");
+        match &program[0].node {
+            ast::Item::Import(imp) => {
+                assert_eq!(imp.path, vec!["std", "math", "trig"]);
+                assert!(imp.names.is_none());
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn parse_import_selective() {
+        let source = "import math.{sin, cos, tan}\n";
+        let program = parser::parse(source).expect("parse failed");
+        match &program[0].node {
+            ast::Item::Import(imp) => {
+                assert_eq!(imp.path, vec!["math"]);
+                let names = imp.names.as_ref().unwrap();
+                assert_eq!(names.len(), 3);
+                assert_eq!(names[0].name, "sin");
+                assert_eq!(names[1].name, "cos");
+                assert_eq!(names[2].name, "tan");
+                assert!(names.iter().all(|n| n.alias.is_none()));
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn parse_import_selective_with_alias() {
+        let source = "import math.{sin as sine, cos}\n";
+        let program = parser::parse(source).expect("parse failed");
+        match &program[0].node {
+            ast::Item::Import(imp) => {
+                assert_eq!(imp.path, vec!["math"]);
+                let names = imp.names.as_ref().unwrap();
+                assert_eq!(names.len(), 2);
+                assert_eq!(names[0].name, "sin");
+                assert_eq!(names[0].alias.as_deref(), Some("sine"));
+                assert_eq!(names[1].name, "cos");
+                assert!(names[1].alias.is_none());
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn parse_import_nested_selective() {
+        let source = "import std.collections.{List, Map}\n";
+        let program = parser::parse(source).expect("parse failed");
+        match &program[0].node {
+            ast::Item::Import(imp) => {
+                assert_eq!(imp.path, vec!["std", "collections"]);
+                let names = imp.names.as_ref().unwrap();
+                assert_eq!(names.len(), 2);
+                assert_eq!(names[0].name, "List");
+                assert_eq!(names[1].name, "Map");
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_import_printer() {
+        let source = "import std.math.{sin as sine, cos}\n";
+        let program = parser::parse(source).expect("parse failed");
+        let output = printer::print_program(&program);
+        assert!(output.contains("import std.math.{sin as sine, cos}"));
     }
 }
